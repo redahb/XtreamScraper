@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Xtream-to-STRM</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Xtream-to-STRM <span id="version" class="muted"></span></div>
+    <nav id="tabs">
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="providers">Providers</button>
+      <button data-tab="sync-history">Sync history</button>
+      <button data-tab="probe-history">Probe history</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="logs">Logs</button>
+    </nav>
+  </header>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <main>
+    <!-- Dashboard -->
+    <section id="tab-dashboard" class="tab">
+      <div id="ffprobe-banner" class="banner warn hidden"></div>
+      <div class="toolbar">
+        <button class="primary" data-action="sync" data-scope="all">Sync All</button>
+        <button data-action="sync" data-scope="movies">Sync All Movies</button>
+        <button data-action="sync" data-scope="series">Sync All Series</button>
+        <span class="sep"></span>
+        <button class="primary" data-action="probe" data-scope="all">Probe All</button>
+        <button data-action="probe" data-scope="movies">Probe Movies</button>
+        <button data-action="probe" data-scope="series">Probe Series</button>
+        <button data-action="probe" data-scope="all" data-force="1">Force re-probe all</button>
+      </div>
+      <h2>Jobs</h2>
+      <div id="jobs"></div>
+      <h2>Providers</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Provider</th><th>Enabled</th><th>Connection</th><th>Activity</th>
+            <th>Last sync</th><th>Last probe</th><th>Library</th>
+          </tr></thead>
+          <tbody id="dashboard-providers"></tbody>
+        </table>
+      </div>
+      <p class="muted small" id="paths"></p>
+    </section>
+
+    <!-- Providers -->
+    <section id="tab-providers" class="tab hidden">
+      <div class="toolbar"><button class="primary" data-action="add-provider">Add Provider</button></div>
+      <div id="provider-form" class="card hidden">
+        <h2 id="provider-form-title">Add provider</h2>
+        <form id="provider-edit" autocomplete="off">
+          <input type="hidden" name="id">
+          <div class="grid">
+            <label>Name<input name="name" required placeholder="Provider A"></label>
+            <label>Xtream base URL<input name="base_url" required placeholder="http://example.com:8080"></label>
+            <label>Username<input name="username" required autocomplete="off"></label>
+            <label>Password<input name="password" type="password" autocomplete="new-password"></label>
+            <label>Custom User-Agent (optional)<input name="user_agent" placeholder="leave empty for default"></label>
+            <label>Target folder<input name="target_folder" placeholder="D:\XtreamLibrary (empty = default from Settings)"></label>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" name="enabled" checked> Enabled</label>
+            <label><input type="checkbox" name="movies_enabled" checked> Sync Movies</label>
+            <label><input type="checkbox" name="series_enabled" checked> Sync Series</label>
+          </div>
+          <p class="muted small" id="password-hint"></p>
+          <div class="toolbar">
+            <button type="submit" class="primary">Save</button>
+            <button type="button" data-action="test-unsaved">Test connection</button>
+            <button type="button" data-action="cancel-provider">Cancel</button>
+            <span id="provider-test-result"></span>
+          </div>
+        </form>
+      </div>
+      <div id="provider-list"></div>
+
+      <div id="category-panel" class="card hidden">
+        <h2>Categories – <span id="category-provider"></span></h2>
+        <p class="muted small" id="category-refreshed"></p>
+        <div class="columns">
+          <div class="column" data-type="movie">
+            <h3>Movie categories <span class="count" data-count="movie"></span></h3>
+            <div class="toolbar small">
+              <button data-action="cat-refresh" data-type="movie">Refresh Categories</button>
+              <button data-action="cat-all" data-type="movie">Select All</button>
+              <button data-action="cat-none" data-type="movie">Select None</button>
+              <input class="filter" data-filter="movie" placeholder="Filter…">
+            </div>
+            <div class="catlist" id="cats-movie"></div>
+          </div>
+          <div class="column" data-type="series">
+            <h3>Series categories <span class="count" data-count="series"></span></h3>
+            <div class="toolbar small">
+              <button data-action="cat-refresh" data-type="series">Refresh Categories</button>
+              <button data-action="cat-all" data-type="series">Select All</button>
+              <button data-action="cat-none" data-type="series">Select None</button>
+              <input class="filter" data-filter="series" placeholder="Filter…">
+            </div>
+            <div class="catlist" id="cats-series"></div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="primary" data-action="cat-save">Save selection</button>
+          <button data-action="cat-close">Close</button>
+          <span id="category-status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sync history -->
+    <section id="tab-sync-history" class="tab hidden">
+      <div class="toolbar">
+        <label>Provider <select id="sync-history-provider" class="provider-filter"></select></label>
+        <button data-action="reload-sync-history">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Provider</th><th>Started</th><th>Type</th><th>Duration</th><th>Result</th>
+            <th>Created</th><th>Updated</th><th>Skipped</th><th>Missing</th><th>Errors</th><th></th></tr></thead>
+          <tbody id="sync-history"></tbody>
+        </table>
+      </div>
+      <div id="sync-detail" class="card hidden"></div>
+    </section>
+
+    <!-- Probe history -->
+    <section id="tab-probe-history" class="tab hidden">
+      <div class="toolbar">
+        <label>Provider <select id="probe-history-provider" class="provider-filter"></select></label>
+        <button data-action="reload-probe-history">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Provider</th><th>Started</th><th>Scope</th><th>Duration</th><th>Result</th>
+            <th>Considered</th><th>Probed</th><th>Skipped (unchanged)</th><th>Succeeded</th><th>Failed</th><th></th></tr></thead>
+          <tbody id="probe-history"></tbody>
+        </table>
+      </div>
+      <div id="probe-detail" class="card hidden"></div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab hidden">
+      <form id="settings-form" class="card">
+        <h2>Web server</h2>
+        <div class="grid">
+          <label>Listen address<input name="web_host"></label>
+          <label>Port<input name="web_port" type="number" min="1" max="65535"></label>
+        </div>
+        <p class="muted small" id="restart-hint">Changing the address or port requires restarting the application.</p>
+        <h2>Library</h2>
+        <div class="grid">
+          <label>Default target folder<input name="default_target_folder" placeholder="D:\XtreamLibrary"></label>
+          <label>Max. file/folder name length<input name="max_name_length" type="number" min="40" max="200"></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" name="clean_titles"> Clean provider tags from titles (|EN|, 4K, HEVC…)</label>
+          <label><input type="checkbox" name="episode_title_in_filename"> Add trustworthy episode titles to episode file names</label>
+        </div>
+        <h2>Xtream requests</h2>
+        <div class="grid">
+          <label>Connect timeout (s)<input name="http_connect_timeout" type="number" step="1"></label>
+          <label>Read timeout (s)<input name="http_read_timeout" type="number" step="1"></label>
+          <label>Retries for transient errors<input name="http_retries" type="number" min="0" max="10"></label>
+          <label>Delay between requests (ms)<input name="request_delay_ms" type="number" min="0"></label>
+          <label>Re-fetch unchanged series at least every N days (0 = always)<input name="series_full_refresh_days" type="number" min="0"></label>
+        </div>
+        <h2>Media probing (ffprobe)</h2>
+        <div class="grid">
+          <label>ffprobe path (empty = auto-detect)<input name="ffprobe_path" placeholder="C:\ffmpeg\bin\ffprobe.exe"></label>
+          <label>Probe timeout per stream (s)<input name="probe_timeout_seconds" type="number" min="5"></label>
+          <label>Analyze duration (ms)<input name="probe_analyze_duration_ms" type="number" min="500"></label>
+          <label>Probe size (KB)<input name="probe_size_kb" type="number" min="32"></label>
+          <label>Parallel probes<input name="probe_concurrency" type="number" min="1" max="16"></label>
+          <label>Retry failed probes after (hours)<input name="probe_retry_failed_after_hours" type="number" min="0"></label>
+          <label>Give up after N failed attempts<input name="probe_max_failed_attempts" type="number" min="1"></label>
+          <label>Re-probe successful items after N days (0 = never)<input name="probe_stale_days" type="number" min="0"></label>
+        </div>
+        <div class="toolbar"><button type="button" data-action="test-ffprobe">Test ffprobe</button><span id="ffprobe-result"></span></div>
+        <h2>Logging &amp; history</h2>
+        <div class="grid">
+          <label>Log level
+            <select name="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select>
+          </label>
+          <label>History rows kept per provider<input name="history_keep_per_provider" type="number" min="5"></label>
+          <label>Delete history older than (days)<input name="history_max_age_days" type="number" min="1"></label>
+        </div>
+        <div class="toolbar"><button type="submit" class="primary">Save settings</button><span id="settings-result"></span></div>
+      </form>
+    </section>
+
+    <!-- Logs -->
+    <section id="tab-logs" class="tab hidden">
+      <div class="toolbar"><button data-action="reload-logs">Refresh</button><span class="muted small" id="log-path"></span></div>
+      <pre id="log-lines" class="log"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
