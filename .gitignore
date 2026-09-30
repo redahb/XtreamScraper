@@ -1,0 +1,21 @@
+# Runtime data (database, logs) – contains provider credentials
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Bundled tools
+ffprobe.exe
+ffmpeg.exe
+bin/
+ffmpeg/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -21,7 +21,8 @@ from ..jobs.progress import JobCancelled, JobProgress
 from ..library.index import LibraryIndex
 from ..library.models import EPISODE, MOVIE, LibraryItem
 from ..nfo.document import NfoError
-from ..nfo.fileinfo import apply_media_info
+from ..mediainfo.models import MEDIA_SCHEMA_VERSION, MediaInfo
+from ..nfo.mediainfo_writer import apply_media_info
 from ..nfo.service import NfoSeed, update_nfo
 from ..storage.db import Database
 from ..storage.probe_state import (
@@ -34,8 +35,8 @@ from ..storage.probe_state import (
 from ..utils.hashing import url_fingerprint
 from ..utils.redact import redact
 from ..utils.timeutil import now_iso
-from .ffprobe import ProbeError, ProbeOptions, parse_ffprobe_output, run_ffprobe
-from .models import MEDIA_SCHEMA_VERSION, MediaInfo
+from .ffprobe_mapper import map_ffprobe
+from .ffprobe_runner import ProbeError, ProbeOptions, run_ffprobe
 from .policy import ProbePolicy, needs_probe
 
 log = logging.getLogger(__name__)
@@ -226,7 +227,7 @@ class ProbeEngine:
         with self._stats_lock:
             self.stats.probed += 1
         try:
-            media = parse_ffprobe_output(self.runner(self.ffprobe_path, url, self.options))
+            media = map_ffprobe(self.runner(self.ffprobe_path, url, self.options))
             if not media.has_useful_data():
                 raise ProbeError("ffprobe found no usable audio/video stream information")
         except ProbeError as exc:

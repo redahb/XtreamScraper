@@ -17,7 +17,7 @@ from ..context import AppContext
 from ..jobs.manager import KIND_SCOPES, BusyError
 from ..metadata.registry import registry as metadata_registry
 from ..probe.engine import ProbeRequest
-from ..probe.ffprobe import ProbeError, ffprobe_version
+from ..probe.ffprobe_runner import ProbeError, ffprobe_version
 from ..storage.categories import CONTENT_TYPES, MOVIE, SERIES
 from ..storage.providers import Provider, ProviderValidationError
 from ..sync.engine import SyncRequest, client_for

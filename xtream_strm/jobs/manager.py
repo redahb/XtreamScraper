@@ -17,7 +17,7 @@ from ..config.settings import Settings, SettingsStore
 from ..filesystem.layout import provider_folder_names
 from ..library.models import EPISODE, MOVIE
 from ..probe.engine import ProbeEngine, ProbeRequest, probe_summary_dict
-from ..probe.ffprobe import locate_ffprobe
+from ..probe.ffprobe_runner import locate_ffprobe
 from ..storage.db import Database
 from ..storage.history import ProbeHistoryRepository, SyncHistoryRepository
 from ..storage.providers import Provider, ProviderRepository

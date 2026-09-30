@@ -27,7 +27,7 @@ class ProbeRecord:
     status: str = STATUS_NEVER
     failed_attempts: int = 0
     last_error: Optional[str] = None
-    media_info: Optional[str] = None  # JSON produced by probe.models.MediaInfo.to_json()
+    media_info: Optional[str] = None  # JSON produced by mediainfo.models.MediaInfo.to_json()
     media_schema: Optional[int] = None
 
 

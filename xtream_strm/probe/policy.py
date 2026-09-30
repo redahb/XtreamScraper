@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+from ..mediainfo.models import MEDIA_SCHEMA_VERSION
 from ..storage.probe_state import STATUS_OK, ProbeRecord
 from ..utils.timeutil import older_than, utcnow
 
@@ -33,6 +34,8 @@ def needs_probe(
     if record.url_hash != url_hash:
         return True, "stream URL changed"
     if record.status == STATUS_OK and record.last_success_at:
+        if record.media_schema != MEDIA_SCHEMA_VERSION:
+            return True, "media-info format upgraded"
         if policy.stale_days > 0 and older_than(record.last_success_at, timedelta(days=policy.stale_days), now):
             return True, "stale"
         return False, "unchanged"

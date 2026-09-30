@@ -61,8 +61,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from waitress import serve
-    except ImportError:  # pragma: no cover - fallback for minimal installs
-        log.warning("waitress not installed; using Flask's development server")
+    except ImportError as exc:  # pragma: no cover - fallback for minimal installs
+        log.warning(
+            "waitress could not be imported (%s) by %s; using Flask's development server. "
+            "Install it for this interpreter with: \"%s\" -m pip install waitress",
+            exc, sys.executable, sys.executable,
+        )
         app.run(host=host, port=port, threaded=True, use_reloader=False)
     else:
         serve(app, host=host, port=port, threads=8, ident=APP_NAME)
