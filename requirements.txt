@@ -1,7 +1,8 @@
 # Runtime
 Flask>=3.0,<4          # BSD-3-Clause – WebUI / JSON API
 waitress>=3.0,<4       # ZPL-2.1 – production WSGI server (pure Python, works on Windows)
-requests>=2.31,<3      # Apache-2.0 – Xtream API client (brings urllib3, MIT)
+requests>=2.31,<3      # Apache-2.0 – Xtream and TMDB API clients (brings urllib3, MIT)
+rapidfuzz>=3.0,<4      # MIT – title similarity for the shared metadata matcher
 
 # Tests
 pytest>=8.0            # MIT

@@ -15,7 +15,8 @@ from .. import __version__
 from ..config.settings import SettingsError
 from ..context import AppContext
 from ..jobs.manager import KIND_SCOPES, BusyError
-from ..metadata.registry import registry as metadata_registry
+from ..metadata.engine import ScrapeRequest
+from ..metadata.plugin import ConfigError
 from ..probe.engine import ProbeRequest
 from ..probe.ffprobe_runner import ProbeError, ffprobe_version
 from ..storage.categories import CONTENT_TYPES, MOVIE, SERIES
@@ -65,7 +66,7 @@ def build_api(ctx: AppContext) -> Blueprint:
             return ctx.client_factory(provider, settings)
         return client_for(provider, settings)
 
-    def provider_view(provider: Provider, latest_sync=None, latest_probe=None) -> dict:
+    def provider_view(provider: Provider, latest_sync=None, latest_probe=None, latest_metadata=None) -> dict:
         data = provider.public_dict()
         settings = ctx.settings_store.load()
         data["effective_target_folder"] = provider.target_folder or settings.default_target_folder
@@ -78,6 +79,8 @@ def build_api(ctx: AppContext) -> Blueprint:
             data["last_sync"] = _history_brief(latest_sync)
         if latest_probe is not None:
             data["last_probe"] = _history_brief(latest_probe)
+        if latest_metadata is not None:
+            data["last_metadata"] = _history_brief(latest_metadata)
         return data
 
     # -- status / dashboard ---------------------------------------------------------------------
@@ -86,13 +89,15 @@ def build_api(ctx: AppContext) -> Blueprint:
         settings = ctx.settings_store.load()
         latest_sync = ctx.sync_history.latest_per_provider()
         latest_probe = ctx.probe_history.latest_per_provider()
+        latest_metadata = ctx.metadata_history.latest_per_provider() if ctx.metadata_history else {}
         path, how = ctx.jobs.ffprobe_location(settings)
         return jsonify(
             version=__version__,
-            providers=[provider_view(p, latest_sync.get(p.id), latest_probe.get(p.id)) for p in ctx.providers.list()],
+            providers=[provider_view(p, latest_sync.get(p.id), latest_probe.get(p.id), latest_metadata.get(p.id))
+                       for p in ctx.providers.list()],
             jobs=ctx.jobs.jobs()[:10],
             ffprobe={"found": path is not None, "path": path, "how": how},
-            metadata_providers=metadata_registry.describe(),
+            scrapers=ctx.scrapers.list() if ctx.scrapers else [],
             data_dir=ctx.paths.data_dir,
             db_path=ctx.paths.db_path,
             log_path=ctx.log_path,
@@ -304,6 +309,98 @@ def build_api(ctx: AppContext) -> Blueprint:
         item = ctx.probe_history.get(row_id)
         return jsonify(item=item) if item else _error("Not found", 404)
 
+    @api.get("/history/metadata")
+    def metadata_history():
+        pid, limit, offset = _limits()
+        return jsonify(items=ctx.metadata_history.list(pid, limit, offset))
+
+    @api.get("/history/metadata/<int:row_id>")
+    def metadata_history_item(row_id: int):
+        item = ctx.metadata_history.get(row_id)
+        return jsonify(item=item) if item else _error("Not found", 404)
+
+    # -- metadata scrapers ------------------------------------------------------------------------
+    def not_installed():
+        return _error("Scraper plugin not installed", 404)
+
+    @api.get("/scrapers")
+    def list_scrapers():
+        return jsonify(plugins=ctx.scrapers.list())
+
+    @api.post("/scrapers/<plugin_id>/enabled")
+    def scraper_enabled(plugin_id: str):
+        try:
+            ctx.scrapers.set_enabled(plugin_id, _bool(_body().get("enabled"), True))
+        except KeyError:
+            return not_installed()
+        return jsonify(plugins=ctx.scrapers.list())
+
+    @api.post("/scrapers/<plugin_id>/overwrite")
+    def scraper_overwrite(plugin_id: str):
+        try:
+            ctx.scrapers.set_overwrite(plugin_id, _bool(_body().get("overwrite")))
+        except KeyError:
+            return not_installed()
+        return jsonify(plugins=ctx.scrapers.list())
+
+    @api.post("/scrapers/<plugin_id>/move")
+    def scraper_move(plugin_id: str):
+        direction = _body().get("direction")
+        if direction not in ("up", "down"):
+            return _error("direction must be up or down")
+        try:
+            ctx.scrapers.move(plugin_id, direction)
+        except KeyError:
+            return not_installed()
+        return jsonify(plugins=ctx.scrapers.list())
+
+    @api.get("/scrapers/<plugin_id>/config")
+    def scraper_config(plugin_id: str):
+        try:
+            return jsonify(ctx.scrapers.public_config(plugin_id))
+        except KeyError:
+            return not_installed()
+
+    @api.put("/scrapers/<plugin_id>/config")
+    def save_scraper_config(plugin_id: str):
+        values = _body().get("values")
+        if not isinstance(values, dict):
+            return _error("'values' must be an object")
+        try:
+            return jsonify(ctx.scrapers.save_config(plugin_id, values))
+        except KeyError:
+            return not_installed()
+        except ConfigError as exc:
+            return _error(str(exc))
+
+    @api.post("/scrapers/<plugin_id>/test")
+    def test_scraper(plugin_id: str):
+        values = _body().get("values")
+        try:
+            ok, message = ctx.scrapers.test(plugin_id, values if isinstance(values, dict) else None)
+        except KeyError:
+            return not_installed()
+        return jsonify(ok=ok, message=message)
+
+    @api.post("/metadata/scrape")
+    def start_scrape():
+        body = _body()
+        scope = body.get("scope", "all")
+        kinds = {"all": ("movie", "series"), "movies": ("movie",), "series": ("series",)}.get(scope)
+        if kinds is None:
+            return _error("scope must be all, movies or series")
+        try:
+            job = ctx.jobs.start_scrape(_provider_arg(body), ScrapeRequest(kinds=kinds, force=_bool(body.get("force"))))
+        except KeyError:
+            return _error("Provider not found", 404)
+        except BusyError as exc:
+            return _error(str(exc), 409)
+        return jsonify(job=job.to_dict()), 202
+
+    @api.get("/about")
+    def about():
+        return jsonify(version=__version__, attributions=ctx.scrapers.attributions() if ctx.scrapers else [])
+
     # -- settings / diagnostics -------------------------------------------------------------------
     @api.get("/settings")
     def get_settings():
@@ -359,5 +456,6 @@ def _history_brief(item: dict) -> dict:
         "error_count": item.get("error_count"),
         "warning_count": item.get("warning_count"),
         **{k: item.get(k) for k in ("created", "updated", "skipped", "missing", "considered", "probed",
-                                    "succeeded", "failed", "sync_type", "scope") if k in item},
+                                    "succeeded", "failed", "sync_type", "scope", "matched", "unmatched",
+                                    "ambiguous", "unchanged") if k in item},
     }

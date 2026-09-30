@@ -1,9 +1,9 @@
-"""Registry of available metadata providers.
+"""Discovery of installed scraper plugins.
 
-Built-in providers register themselves by module import (future ``metadata/tmdb.py``,
-``metadata/tvdb.py``). Third-party providers can be dropped into a ``plugins`` folder
-next to the application as ``*.py`` files defining :class:`MetadataProvider` subclasses;
-:func:`discover_plugins` imports them.
+Built-in plugins are registered by the application at start-up; additional plugins can
+be dropped into ``<app>/plugins/*.py``. The registry only knows which plugins exist;
+their enabled/priority/overwrite state and configuration live in the database
+(:mod:`.manager`).
 """
 
 from __future__ import annotations
@@ -15,43 +15,38 @@ import os
 import threading
 from typing import Optional, Type
 
-from .base import MetadataProvider
+from .plugin import ScraperPlugin
 
 log = logging.getLogger(__name__)
 
 
-class MetadataRegistry:
+class PluginRegistry:
     def __init__(self) -> None:
-        self._providers: dict[str, MetadataProvider] = {}
+        self._plugins: dict[str, ScraperPlugin] = {}
         self._lock = threading.Lock()
 
-    def register(self, provider: MetadataProvider | Type[MetadataProvider]) -> MetadataProvider:
-        instance = provider() if inspect.isclass(provider) else provider
-        if not instance.id:
-            raise ValueError("Metadata provider needs a non-empty id")
+    def register(self, plugin: ScraperPlugin | Type[ScraperPlugin]) -> ScraperPlugin:
+        instance = plugin() if inspect.isclass(plugin) else plugin
+        if not instance.plugin_id:
+            raise ValueError("Scraper plugin needs a non-empty plugin_id")
         with self._lock:
-            self._providers[instance.id] = instance
-        log.info("Metadata provider registered: %s", instance.id)
+            self._plugins[instance.plugin_id] = instance
+        log.info("Scraper plugin installed: %s %s", instance.plugin_id, instance.version or "")
         return instance
 
-    def unregister(self, provider_id: str) -> None:
+    def unregister(self, plugin_id: str) -> None:
         with self._lock:
-            self._providers.pop(provider_id, None)
+            self._plugins.pop(plugin_id, None)
 
-    def get(self, provider_id: str) -> Optional[MetadataProvider]:
-        return self._providers.get(provider_id)
+    def get(self, plugin_id: str) -> Optional[ScraperPlugin]:
+        return self._plugins.get(plugin_id)
 
-    def all(self) -> list[MetadataProvider]:
-        return list(self._providers.values())
+    def all(self) -> list[ScraperPlugin]:
+        with self._lock:
+            return list(self._plugins.values())
 
-    def describe(self) -> list[dict]:
-        return [
-            {"id": p.id, "name": p.name or p.id, "capabilities": sorted(c.value for c in p.capabilities)}
-            for p in self.all()
-        ]
-
-    def discover_plugins(self, directory: str) -> int:
-        """Import every ``*.py`` in ``directory`` and register provider classes found in it."""
+    def discover(self, directory: str) -> int:
+        """Import ``*.py`` files in ``directory`` and register the plugin classes they define."""
         if not os.path.isdir(directory):
             return 0
         count = 0
@@ -66,16 +61,17 @@ class MetadataRegistry:
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
             except Exception:
-                log.exception("Failed to load metadata plugin %s", filename)
+                log.exception("Failed to load scraper plugin file %s", filename)
                 continue
             for _, obj in inspect.getmembers(module, inspect.isclass):
-                if issubclass(obj, MetadataProvider) and obj is not MetadataProvider and obj.id:
+                if issubclass(obj, ScraperPlugin) and obj is not ScraperPlugin and obj.plugin_id \
+                        and obj.__module__ == module.__name__:
                     try:
                         self.register(obj)
                         count += 1
                     except Exception:
-                        log.exception("Failed to register metadata plugin class %s", obj.__name__)
+                        log.exception("Failed to register scraper plugin %s", obj.__name__)
         return count
 
 
-registry = MetadataRegistry()
+registry = PluginRegistry()

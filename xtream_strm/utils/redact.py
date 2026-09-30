@@ -23,7 +23,11 @@ _PATH_CREDENTIALS = re.compile(
     r"(/(?:movie|series|live|timeshift)/)([^/\s?#]+)/([^/\s?#]+)(/)", re.IGNORECASE
 )
 # username=...&password=... in query strings or form bodies
-_QUERY_CREDENTIALS = re.compile(r"((?:username|password|user|pass)=)([^&\s#'\"]+)", re.IGNORECASE)
+_QUERY_CREDENTIALS = re.compile(
+    r"((?:username|password|user|pass|api_key|apikey|access_token|token)=)([^&\s#'\"]+)", re.IGNORECASE
+)
+# Authorization: Bearer <token>
+_BEARER = re.compile(r"(\bBearer\s+)([A-Za-z0-9._~+/=-]+)", re.IGNORECASE)
 # scheme://user:pass@host
 _USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
 
@@ -51,6 +55,7 @@ def redact(text: object, extra_secrets: Iterable[Optional[str]] = ()) -> str:
     result = _PATH_CREDENTIALS.sub(lambda m: f"{m.group(1)}{MASK}/{MASK}{m.group(4)}", result)
     result = _QUERY_CREDENTIALS.sub(lambda m: f"{m.group(1)}{MASK}", result)
     result = _USERINFO.sub(lambda m: f"{m.group(1)}{MASK}:{MASK}@", result)
+    result = _BEARER.sub(lambda m: f"{m.group(1)}{MASK}", result)
     with _lock:
         secrets = set(_secrets)
     secrets.update(s for s in extra_secrets if s and len(s) >= 3)

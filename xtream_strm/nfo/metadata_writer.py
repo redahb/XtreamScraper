@@ -1,178 +1,155 @@
-"""Renders normalised metadata models into NFO documents.
+"""Serializes a :class:`MetadataResult` into an NFO document.
 
-Only fields with known values are replaced. ``<fileinfo>`` is never touched here, so
-probe-derived stream details survive metadata updates. Values keyed by a source
-(``<uniqueid type=...>``, ``<rating name=...>``, ``<thumb aspect=...>``) are replaced
-per source, so several metadata providers can contribute to one NFO.
+The only code that writes descriptive-metadata XML. It replaces a tag group only when
+the model holds a meaningful value for it, so nothing is ever removed because a value is
+missing. ``<fileinfo>`` and tags outside the managed vocabulary are never touched.
 """
 
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from typing import Iterable, Optional
+from typing import Optional
 
-from ..metadata.models import (
-    Artwork,
-    EpisodeMetadata,
-    ExternalIds,
-    MovieMetadata,
-    Person,
-    Rating,
-    SeasonMetadata,
-    TvShowMetadata,
-)
+from ..metadata.merge import KEY_FUNCTIONS, dedupe, meaningful
+from ..metadata.models import ArtworkType, MetadataResult, PersonCredit
 from .document import NfoDocument
+from .metadata_vocabulary import DATE_TAG, MANAGED_ASPECTS, THUMB_ASPECT
+from .paths import NfoKind
 
 
-def _actors(doc: NfoDocument, people: Optional[list[Person]]) -> None:
-    if people is None:
+def _set(doc: NfoDocument, tag: str, value: object) -> None:
+    if meaningful(value) or (isinstance(value, int) and not isinstance(value, bool) and value == 0
+                             and tag in ("season", "seasonnumber")):
+        doc.set_text(tag, value if not isinstance(value, float) else f"{value:g}")
+
+
+def _set_list(doc: NfoDocument, tag: str, values: Optional[list[str]]) -> None:
+    clean = dedupe(values or [], KEY_FUNCTIONS["genres"])
+    if clean:
+        doc.set_list(tag, clean)
+
+
+def _set_people(doc: NfoDocument, tag: str, people: Optional[list[PersonCredit]], key: str) -> None:
+    clean = dedupe(people or [], KEY_FUNCTIONS[key])
+    if clean:
+        doc.set_list(tag, [p.name for p in clean])
+
+
+def _actors(doc: NfoDocument, actors: Optional[list[PersonCredit]]) -> None:
+    clean = dedupe(actors or [], KEY_FUNCTIONS["actors"])
+    if not clean:
         return
     elements = []
-    for index, person in enumerate(people):
-        if not person.name:
-            continue
-        actor = ET.Element("actor")
-        ET.SubElement(actor, "name").text = person.name
-        if person.role:
-            ET.SubElement(actor, "role").text = person.role
-        ET.SubElement(actor, "order").text = str(person.order if person.order is not None else index)
-        if person.thumb:
-            ET.SubElement(actor, "thumb").text = person.thumb
-        elements.append(actor)
+    for index, person in enumerate(clean):
+        el = ET.Element("actor")
+        ET.SubElement(el, "name").text = person.name
+        if meaningful(person.role):
+            ET.SubElement(el, "role").text = person.role
+        ET.SubElement(el, "order").text = str(person.order if person.order is not None else index)
+        if meaningful(person.profile_image):
+            ET.SubElement(el, "thumb").text = person.profile_image
+        elements.append(el)
     doc.replace_elements("actor", elements)
 
 
-def _ratings(doc: NfoDocument, ratings: Optional[list[Rating]]) -> None:
+def _unique_ids(doc: NfoDocument, meta: MetadataResult) -> None:
+    ids = [(k, v) for k, v in meta.external_ids.items() if k and meaningful(v)]
+    if not ids:
+        return
+    default = meta.default_id_type if meta.default_id_type in dict(ids) else None
+    elements = []
+    for id_type, value in ids:
+        el = ET.Element("uniqueid", {"type": id_type})
+        if id_type == default:
+            el.set("default", "true")
+        el.text = str(value)
+        elements.append(el)
+    doc.replace_elements("uniqueid", elements)
+
+
+def _ratings(doc: NfoDocument, meta: MetadataResult) -> None:
+    ratings = [(k, r) for k, r in meta.ratings.items() if k and meaningful(r)]
     if not ratings:
         return
-    container = doc.find_or_create("ratings")
-    for rating in ratings:
-        for old in [r for r in container.findall("rating") if (r.get("name") or "").lower() == rating.source.lower()]:
-            container.remove(old)
-        element = ET.SubElement(container, "rating", {"name": rating.source, "max": f"{rating.max_value:g}"})
-        if rating.default:
-            for other in container.findall("rating"):
-                other.attrib.pop("default", None)
-            element.set("default", "true")
-        ET.SubElement(element, "value").text = f"{rating.value:g}"
-        if rating.votes is not None:
-            ET.SubElement(element, "votes").text = str(rating.votes)
+    default = meta.default_rating if meta.default_rating in dict(ratings) else None
+    container = ET.Element("ratings")
+    for name, rating in ratings:
+        el = ET.SubElement(container, "rating", {"name": name, "max": f"{rating.max_value:g}"})
+        if name == default:
+            el.set("default", "true")
+        ET.SubElement(el, "value").text = f"{rating.value:g}"
+        if rating.votes:
+            ET.SubElement(el, "votes").text = str(rating.votes)
+    doc.replace_elements("ratings", [container])
 
 
-def _ids(doc: NfoDocument, ids: ExternalIds, default_order: Iterable[str]) -> None:
-    items = ids.items()
-    if not items:
-        return
-    present = {k for k, _ in items}
-    default_type = next((t for t in default_order if t in present), None)
-    for id_type, value in items:
-        doc.set_uniqueid(id_type, value, default=id_type == default_type)
-    if ids.imdb:
-        doc.set_text("imdbid", ids.imdb)
-    if ids.tmdb:
-        doc.set_text("tmdbid", ids.tmdb)
-    if ids.tvdb:
-        doc.set_text("tvdbid", ids.tvdb)
-
-
-def _artwork(doc: NfoDocument, artwork: Optional[list[Artwork]]) -> None:
-    if not artwork:
-        return
-    thumbs = [a for a in artwork if a.kind != "fanart"]
-    fanart = [a for a in artwork if a.kind == "fanart"]
-    replaced: set[tuple[str, Optional[int]]] = set()
-    for art in thumbs:
-        key = (art.kind, art.season)
-        if key not in replaced:
-            for old in list(doc.root.findall("thumb")):
-                season = old.get("season")
-                if old.get("aspect") == art.kind and (season == (str(art.season) if art.season is not None else None)):
-                    doc.root.remove(old)
-            replaced.add(key)
-        attrs = {"aspect": art.kind}
-        if art.season is not None:
-            attrs.update(type="season", season=str(art.season))
-        if art.preview:
-            attrs["preview"] = art.preview
-        element = ET.Element("thumb", attrs)
-        element.text = art.url
-        doc.root.append(element)
+def _artwork(doc: NfoDocument, meta: MetadataResult, kind: NfoKind) -> None:
+    art = dedupe(meta.artwork or [], KEY_FUNCTIONS["artwork"])
+    thumbs = [a for a in art if a.type is not ArtworkType.FANART]
+    fanart = [a for a in art if a.type is ArtworkType.FANART]
+    if thumbs:
+        position = next((i for i, c in enumerate(doc.root) if c.tag == "thumb"), None)
+        for old in [c for c in doc.root.findall("thumb") if (c.get("aspect") or "").lower() in MANAGED_ASPECTS]:
+            doc.root.remove(old)
+        new = []
+        for a in thumbs:
+            if a.type is ArtworkType.SEASON_POSTER and kind is NfoKind.TVSHOW:
+                el = ET.Element("thumb", {"aspect": "poster", "type": "season", "season": str(a.season_number or 0)})
+            elif a.type is ArtworkType.STILL and kind is not NfoKind.EPISODE:
+                el = ET.Element("thumb", {"aspect": "landscape"})
+            else:
+                aspect = THUMB_ASPECT.get(a.type, "")
+                el = ET.Element("thumb", {"aspect": aspect} if aspect else {})
+            el.text = a.url
+            new.append(el)
+        if position is None or position > len(doc.root):
+            doc.root.extend(new)
+        else:
+            for offset, el in enumerate(new):
+                doc.root.insert(position + offset, el)
     if fanart:
         container = ET.Element("fanart")
-        for art in fanart:
-            thumb = ET.SubElement(container, "thumb")
-            if art.preview:
-                thumb.set("preview", art.preview)
-            thumb.text = art.url
+        for a in fanart:
+            ET.SubElement(container, "thumb").text = a.url
         doc.replace_elements("fanart", [container])
 
 
-def _year(value: Optional[int]) -> Optional[str]:
-    return str(value) if value else None
-
-
-def apply_movie_metadata(doc: NfoDocument, meta: MovieMetadata) -> None:
-    doc.set_text("title", meta.title)
-    doc.set_text("originaltitle", meta.original_title)
-    doc.set_text("sorttitle", meta.sort_title)
-    doc.set_text("year", _year(meta.year))
-    doc.set_text("premiered", meta.premiered)
-    doc.set_text("plot", meta.plot)
-    doc.set_text("outline", meta.outline)
-    doc.set_text("tagline", meta.tagline)
-    doc.set_text("runtime", meta.runtime_minutes)
-    doc.set_text("mpaa", meta.mpaa)
-    doc.set_list("genre", meta.genres)
-    doc.set_list("studio", meta.studios)
-    doc.set_list("country", meta.countries)
-    doc.set_list("director", meta.directors)
-    doc.set_list("credits", meta.writers)
-    doc.set_list("tag", meta.tags)
-    if meta.collection:
-        collection = ET.Element("set")
-        ET.SubElement(collection, "name").text = meta.collection
-        doc.replace_elements("set", [collection])
-    _ratings(doc, meta.ratings)
-    _ids(doc, meta.ids, ("tmdb", "imdb", "tvdb"))
+def apply_metadata(doc: NfoDocument, meta: MetadataResult) -> None:
+    """Write ``meta`` into ``doc``. ``<fileinfo>`` is never touched."""
+    kind = doc.kind or NfoKind.MOVIE
+    _set(doc, "title", meta.title)
+    _set(doc, "originaltitle", meta.original_title)
+    _set(doc, "sorttitle", meta.sort_title)
+    if kind is NfoKind.EPISODE:
+        _set(doc, "showtitle", meta.show_title)
+        _set(doc, "season", meta.season_number)
+        _set(doc, "episode", meta.episode_number)
+    if kind is NfoKind.SEASON:
+        _set(doc, "seasonnumber", meta.season_number)
+    _set(doc, "plot", meta.plot)
+    _set(doc, "outline", meta.outline)
+    _set(doc, "tagline", meta.tagline)
+    if kind is not NfoKind.EPISODE:
+        _set(doc, "year", meta.year)
+    _set(doc, DATE_TAG[kind], meta.premiered)
+    _set(doc, "runtime", meta.runtime_minutes)
+    _set(doc, "mpaa", meta.certification)
+    if kind is NfoKind.TVSHOW:
+        _set(doc, "status", meta.status)
+    _set_list(doc, "genre", meta.genres)
+    _set_list(doc, "country", meta.countries)
+    _set_list(doc, "studio", (meta.studios or []) + (meta.networks or []))
+    _set_list(doc, "tag", meta.tags)
+    _set_people(doc, "director", meta.directors, "directors")
+    _set_people(doc, "credits", meta.writers, "writers")
+    if meta.collection is not None and meaningful(meta.collection.name) and kind is NfoKind.MOVIE:
+        el = ET.Element("set")
+        ET.SubElement(el, "name").text = meta.collection.name
+        if meaningful(meta.collection.overview):
+            ET.SubElement(el, "overview").text = meta.collection.overview
+        doc.replace_elements("set", [el])
+    _ratings(doc, meta)
+    _unique_ids(doc, meta)
     _actors(doc, meta.actors)
-    _artwork(doc, meta.artwork)
-
-
-def apply_tvshow_metadata(doc: NfoDocument, meta: TvShowMetadata) -> None:
-    doc.set_text("title", meta.title)
-    doc.set_text("originaltitle", meta.original_title)
-    doc.set_text("year", _year(meta.year))
-    doc.set_text("premiered", meta.premiered)
-    doc.set_text("plot", meta.plot)
-    doc.set_text("status", meta.status)
-    doc.set_text("mpaa", meta.mpaa)
-    doc.set_list("genre", meta.genres)
-    doc.set_list("studio", meta.studios)
-    _ratings(doc, meta.ratings)
-    _ids(doc, meta.ids, ("tvdb", "tmdb", "imdb"))
-    _actors(doc, meta.actors)
-    _artwork(doc, meta.artwork)
-
-
-def apply_season_metadata(doc: NfoDocument, meta: SeasonMetadata) -> None:
-    doc.set_text("seasonnumber", meta.season_number)
-    doc.set_text("title", meta.title)
-    doc.set_text("plot", meta.plot)
-    doc.set_text("premiered", meta.premiered)
-    _ids(doc, meta.ids, ("tvdb", "tmdb"))
-    _artwork(doc, meta.artwork)
-
-
-def apply_episode_metadata(doc: NfoDocument, meta: EpisodeMetadata) -> None:
-    doc.set_text("title", meta.title)
-    doc.set_text("season", meta.season)
-    doc.set_text("episode", meta.episode)
-    doc.set_text("plot", meta.plot)
-    doc.set_text("aired", meta.aired)
-    doc.set_text("runtime", meta.runtime_minutes)
-    doc.set_list("director", meta.directors)
-    doc.set_list("credits", meta.writers)
-    _ratings(doc, meta.ratings)
-    _ids(doc, meta.ids, ("tvdb", "tmdb", "imdb"))
-    _actors(doc, meta.actors)
-    _artwork(doc, meta.artwork)
+    _artwork(doc, meta, kind)
+    _set(doc, "trailer", meta.trailer)

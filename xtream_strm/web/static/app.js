@@ -56,6 +56,9 @@ function showTab(name) {
   if (name === "probe-history") loadProbeHistory();
   if (name === "settings") loadSettings();
   if (name === "logs") loadLogs();
+  if (name === "scrapers") loadScrapers();
+  if (name === "metadata-history") loadMetadataHistory();
+  if (name === "about") loadAbout();
   if (name === "providers") renderProviders();
 }
 
@@ -133,6 +136,12 @@ function probeCell(p) {
     <span class="small muted">${p.probed ?? 0} probed · ${p.succeeded ?? 0} ok · ${p.failed ?? 0} failed · ${p.skipped ?? 0} skipped</span>`;
 }
 
+function metadataCell(m) {
+  if (!m) return '<span class="muted">never</span>';
+  return `${badge(m.status)} <span class="small">${fmtTime(m.started_at)}</span><br>
+    <span class="small muted">${m.matched ?? 0} matched · ${m.updated ?? 0} updated · ${m.unmatched ?? 0} unmatched · ${m.ambiguous ?? 0} ambiguous · ${m.error_count} err</span>`;
+}
+
 function connCell(p) {
   if (p.last_test_ok == null) return '<span class="muted">not tested</span>';
   return `${badge(p.last_test_ok ? "ok" : "failed")}<br><span class="small muted">${esc(p.last_test_message || "")}</span>`;
@@ -141,7 +150,7 @@ function connCell(p) {
 function renderDashboardProviders(providers) {
   const body = $("#dashboard-providers");
   if (!providers.length) {
-    body.innerHTML = '<tr><td colspan="7" class="muted">No providers yet – add one on the Providers tab.</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="muted">No providers yet – add one on the Providers tab.</td></tr>';
     return;
   }
   body.innerHTML = providers.map((p) => {
@@ -153,6 +162,7 @@ function renderDashboardProviders(providers) {
       <td>${p.activity ? badge("running").replace(">running<", `>${esc(p.activity)}<`) : '<span class="muted">idle</span>'}</td>
       <td>${syncCell(p.last_sync)}</td>
       <td>${probeCell(p.last_probe)}</td>
+      <td>${metadataCell(p.last_metadata)}</td>
       <td class="small">${c.movies_active} movies · ${c.series_active} series · ${c.episodes_active} episodes
         ${c.movies_missing + c.episodes_missing ? `<br><span class="muted">${c.movies_missing} movies / ${c.episodes_missing} episodes missing at provider</span>` : ""}</td>
     </tr>`;
@@ -194,6 +204,8 @@ function renderProviders() {
         <button data-action="probe" data-id="${p.id}" data-scope="movies">Probe Movies</button>
         <button data-action="probe" data-id="${p.id}" data-scope="series">Probe Series</button>
         <button data-action="probe" data-id="${p.id}" data-scope="all" data-force="1">Force re-probe</button>
+        <button data-action="scrape" data-id="${p.id}" data-scope="all">Scrape Metadata</button>
+        <button data-action="scrape" data-id="${p.id}" data-scope="all" data-force="1">Force metadata refresh</button>
         <button class="danger" data-action="delete-provider" data-id="${p.id}">Delete</button>
       </div>
     </div>`).join("");
@@ -407,6 +419,106 @@ async function loadLogs() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Metadata scrapers
+// ---------------------------------------------------------------------------------------
+async function loadScrapers() {
+  const data = await api("GET", "/scrapers");
+  const body = $("#scraper-list");
+  const n = data.plugins.length;
+  body.innerHTML = n ? data.plugins.map((p, i) => `<tr>
+    <td>${p.priority}
+      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="up" ${i === 0 ? "disabled" : ""} title="Move up">▲</button>
+      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="down" ${i === n - 1 ? "disabled" : ""} title="Move down">▼</button></td>
+    <td><strong>${esc(p.name)}</strong> ${p.version ? `<span class="muted small">v${esc(p.version)}</span>` : ""}</td>
+    <td class="small">${p.media_types.map(esc).join(", ") || "–"}</td>
+    <td><label class="small"><span><input type="checkbox" data-action="scraper-enabled" data-id="${esc(p.plugin_id)}" ${p.enabled ? "checked" : ""}> ${p.enabled ? "enabled" : "disabled"}</span></label></td>
+    <td><label class="small"><span><input type="checkbox" data-action="scraper-overwrite" data-id="${esc(p.plugin_id)}" ${p.overwrite ? "checked" : ""}> ${p.overwrite ? "on" : "off"}</span></label></td>
+    <td>${p.configured ? badge("ok").replace(">ok<", ">configured<") : '<span class="badge s-warn">not configured</span>'}</td>
+    <td>${p.has_config ? `<button data-action="scraper-configure" data-id="${esc(p.plugin_id)}">Configure</button>` : ""}
+      <button data-action="scraper-test" data-id="${esc(p.plugin_id)}">Test</button></td></tr>`).join("")
+    : '<tr><td colspan="7" class="muted">No scraper plugins installed.</td></tr>';
+}
+
+const scraperPage = { id: null, schema: [] };
+
+async function openScraperConfig(id) {
+  const data = await api("GET", `/scrapers/${encodeURIComponent(id)}/config`);
+  scraperPage.id = id;
+  scraperPage.schema = data.schema;
+  $("#scraper-config-title").textContent = `${data.name} Settings`;
+  $("#scraper-config-result").textContent = "";
+  $("#scraper-config-fields").innerHTML = data.schema.map((f) => {
+    const value = data.values[f.key] ?? f.default ?? "";
+    const help = f.help ? `<span class="small muted">${esc(f.help)}</span>` : "";
+    if (f.type === "boolean") {
+      return `<label class="checks"><span><input type="checkbox" name="${esc(f.key)}" ${value ? "checked" : ""}> ${esc(f.label)}</span>${help}</label>`;
+    }
+    if (f.type === "select") {
+      return `<label>${esc(f.label)}<select name="${esc(f.key)}">${f.choices.map((c) =>
+        `<option value="${esc(c.value)}" ${c.value === value ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select>${help}</label>`;
+    }
+    if (f.type === "secret") {
+      const set = data.secrets[f.key];
+      return `<label>${esc(f.label)} ${set ? badge("ok").replace(">ok<", ">configured<") : '<span class="badge s-warn">not set</span>'}
+        <input type="password" name="${esc(f.key)}" autocomplete="new-password" placeholder="${set ? "Configured – leave empty to keep" : ""}">${help}</label>`;
+    }
+    const type = f.type === "integer" ? "number" : "text";
+    const bounds = (f.minimum != null ? ` min="${f.minimum}"` : "") + (f.maximum != null ? ` max="${f.maximum}"` : "");
+    return `<label>${esc(f.label)}<input type="${type}" name="${esc(f.key)}" value="${esc(value)}"${bounds}>${help}</label>`;
+  }).join("") || '<p class="muted">This scraper has no settings.</p>';
+  showTab("scraper-config");
+}
+
+function scraperFormValues() {
+  const form = $("#scraper-config-form");
+  const values = {};
+  for (const f of scraperPage.schema) {
+    const input = form.elements[f.key];
+    if (!input) continue;
+    values[f.key] = f.type === "boolean" ? input.checked : input.value;
+  }
+  return values;
+}
+
+async function saveScraperConfig(ev) {
+  ev.preventDefault();
+  try {
+    await api("PUT", `/scrapers/${encodeURIComponent(scraperPage.id)}/config`, { values: scraperFormValues() });
+    toast("Scraper settings saved");
+    openScraperConfig(scraperPage.id);
+  } catch (e) {
+    $("#scraper-config-result").textContent = e.message;
+    toast(e.message, true);
+  }
+}
+
+async function testScraper(id, values) {
+  const res = await api("POST", `/scrapers/${encodeURIComponent(id)}/test`, values ? { values } : {});
+  return `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
+}
+
+async function loadMetadataHistory() {
+  const pid = $("#metadata-history-provider").value;
+  const data = await api("GET", "/history/metadata" + (pid ? `?provider_id=${pid}` : ""));
+  $("#metadata-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
+    <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.scope)}${h.forced ? " (forced)" : ""}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${h.considered}</td><td>${h.matched}</td><td>${h.unmatched}</td><td>${h.ambiguous}</td><td>${h.updated}</td>
+    <td>${h.unchanged}</td><td>${h.skipped}</td><td>${h.error_count ? `<span class="s-err">${h.error_count}</span>` : 0}</td>
+    <td class="small">${(h.plugins || []).map(esc).join(", ")}</td>
+    <td><button data-action="metadata-detail" data-id="${h.id}">Details</button></td></tr>`).join("")
+    : '<tr><td colspan="15" class="muted">No metadata history.</td></tr>';
+}
+
+async function loadAbout() {
+  const data = await api("GET", "/about");
+  $("#about-version").textContent = "v" + data.version;
+  $("#about-attributions").innerHTML = data.attributions.length ? data.attributions.map((a) =>
+    `<p><strong>${esc(a.name)}</strong>: ${esc(a.text)} ${a.url ? `<a href="${esc(a.url)}" rel="noopener noreferrer" target="_blank">${esc(a.url)}</a>` : ""}</p>`).join("")
+    : '<p class="muted">No metadata scrapers installed.</p>';
+}
+
+// ---------------------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------------------
 async function startJob(kind, btn) {
@@ -415,7 +527,7 @@ async function startJob(kind, btn) {
   if (btn.dataset.force) body.force = true;
   if (btn.dataset.full) body.full_refresh = true;
   try {
-    const res = await api("POST", "/" + kind, body);
+    const res = await api("POST", kind === "scrape" ? "/metadata/scrape" : "/" + kind, body);
     toast(`Started: ${res.job.description}`);
     showTab("dashboard");
     refreshStatus();
@@ -474,6 +586,17 @@ const actions = {
     $("#ffprobe-result").innerHTML = `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
   },
   "reload-logs": () => loadLogs(),
+  "scrape": (btn) => startJob("scrape", btn),
+  "scraper-move": async (btn) => { await api("POST", `/scrapers/${encodeURIComponent(btn.dataset.id)}/move`, { direction: btn.dataset.dir }); loadScrapers(); },
+  "scraper-configure": (btn) => openScraperConfig(btn.dataset.id),
+  "scraper-test": async (btn) => { btn.disabled = true; try { const html = await testScraper(btn.dataset.id); toast(btn.closest("tr").querySelector("strong").textContent + ": " + html.replace(/<[^>]+>/g, "")); } finally { btn.disabled = false; } },
+  "scraper-test-form": async () => { $("#scraper-config-result").textContent = "Testing…"; $("#scraper-config-result").innerHTML = await testScraper(scraperPage.id, scraperFormValues()); },
+  "scraper-back": () => showTab("scrapers"),
+  "reload-metadata-history": () => loadMetadataHistory(),
+  "metadata-detail": async (btn) => {
+    const data = await api("GET", `/history/metadata/${btn.dataset.id}`);
+    const el = $("#metadata-detail"); el.innerHTML = detailHtml(data.item, "Metadata scrape"); el.classList.remove("hidden"); el.scrollIntoView({ behavior: "smooth" });
+  },
 };
 
 document.addEventListener("click", (ev) => {
@@ -493,7 +616,11 @@ document.addEventListener("change", async (ev) => {
   } else if (t.dataset.cat) {
     updateCategoryCount(t.dataset.cat);
   } else if (t.classList.contains("provider-filter")) {
-    t.id.startsWith("sync") ? loadSyncHistory() : loadProbeHistory();
+    t.id.startsWith("sync") ? loadSyncHistory() : t.id.startsWith("probe") ? loadProbeHistory() : loadMetadataHistory();
+  } else if (t.dataset.action === "scraper-enabled" || t.dataset.action === "scraper-overwrite") {
+    const field = t.dataset.action === "scraper-enabled" ? "enabled" : "overwrite";
+    try { await api("POST", `/scrapers/${encodeURIComponent(t.dataset.id)}/${field}`, { [field]: t.checked }); } catch (e) { toast(e.message, true); }
+    loadScrapers();
   }
 });
 
@@ -503,4 +630,5 @@ document.addEventListener("input", (ev) => {
 
 $("#provider-edit").addEventListener("submit", saveProvider);
 $("#settings-form").addEventListener("submit", saveSettings);
+$("#scraper-config-form").addEventListener("submit", saveScraperConfig);
 refreshStatus();

@@ -14,8 +14,11 @@
       <button data-tab="providers">Providers</button>
       <button data-tab="sync-history">Sync history</button>
       <button data-tab="probe-history">Probe history</button>
+      <button data-tab="scrapers">Metadata Scrapers</button>
+      <button data-tab="metadata-history">Metadata history</button>
       <button data-tab="settings">Settings</button>
       <button data-tab="logs">Logs</button>
+      <button data-tab="about">About</button>
     </nav>
   </header>
 
@@ -34,6 +37,11 @@
         <button data-action="probe" data-scope="movies">Probe Movies</button>
         <button data-action="probe" data-scope="series">Probe Series</button>
         <button data-action="probe" data-scope="all" data-force="1">Force re-probe all</button>
+        <span class="sep"></span>
+        <button class="primary" data-action="scrape" data-scope="all">Scrape Metadata</button>
+        <button data-action="scrape" data-scope="movies">Scrape Movies</button>
+        <button data-action="scrape" data-scope="series">Scrape Series</button>
+        <button data-action="scrape" data-scope="all" data-force="1">Force metadata refresh</button>
       </div>
       <h2>Jobs</h2>
       <div id="jobs"></div>
@@ -42,7 +50,7 @@
         <table>
           <thead><tr>
             <th>Provider</th><th>Enabled</th><th>Connection</th><th>Activity</th>
-            <th>Last sync</th><th>Last probe</th><th>Library</th>
+            <th>Last sync</th><th>Last probe</th><th>Last metadata</th><th>Library</th>
           </tr></thead>
           <tbody id="dashboard-providers"></tbody>
         </table>
@@ -146,6 +154,64 @@
       <div id="probe-detail" class="card hidden"></div>
     </section>
 
+    <!-- Metadata scrapers -->
+    <section id="tab-scrapers" class="tab hidden">
+      <p class="muted small">Enabled scrapers run in priority order for every item. By default a scraper only fills
+        empty fields; with <em>overwrite</em> on, its meaningful values replace existing ones (it never erases values).
+        External IDs and ratings from different sources always coexist.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Priority</th><th>Scraper</th><th>Media types</th><th>Enabled</th><th>Overwrite</th>
+            <th>Configuration</th><th></th></tr></thead>
+          <tbody id="scraper-list"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- A scraper's own configuration page -->
+    <section id="tab-scraper-config" class="tab hidden">
+      <form id="scraper-config-form" class="card" autocomplete="off">
+        <h2 id="scraper-config-title">Scraper settings</h2>
+        <div class="grid" id="scraper-config-fields"></div>
+        <div class="toolbar">
+          <button type="submit" class="primary">Save</button>
+          <button type="button" data-action="scraper-test-form">Test Connection</button>
+          <button type="button" data-action="scraper-back">Back to Metadata Scrapers</button>
+          <span id="scraper-config-result"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Metadata history -->
+    <section id="tab-metadata-history" class="tab hidden">
+      <div class="toolbar">
+        <label>Provider <select id="metadata-history-provider" class="provider-filter"></select></label>
+        <button data-action="reload-metadata-history">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Provider</th><th>Started</th><th>Scope</th><th>Duration</th><th>Result</th>
+            <th>Considered</th><th>Matched</th><th>Unmatched</th><th>Ambiguous</th><th>Updated</th><th>Unchanged</th>
+            <th>Skipped</th><th>Errors</th><th>Scrapers</th><th></th></tr></thead>
+          <tbody id="metadata-history"></tbody>
+        </table>
+      </div>
+      <div id="metadata-detail" class="card hidden"></div>
+    </section>
+
+    <!-- About -->
+    <section id="tab-about" class="tab hidden">
+      <div class="card">
+        <h2>Xtream-to-STRM <span id="about-version" class="muted"></span></h2>
+        <p>Standalone Xtream VOD/Series to STRM library manager.</p>
+        <h3>Metadata sources</h3>
+        <div id="about-attributions"></div>
+        <p class="muted small">Metadata scrapers use third-party services. You are responsible for obtaining your own
+          API credentials and for using them under each service's terms. This application is not endorsed or
+          certified by any of these services.</p>
+      </div>
+    </section>
+
     <!-- Settings -->
     <section id="tab-settings" class="tab hidden">
       <form id="settings-form" class="card">
@@ -183,6 +249,11 @@
           <label>Give up after N failed attempts<input name="probe_max_failed_attempts" type="number" min="1"></label>
           <label>Re-probe successful items after N days (0 = never)<input name="probe_stale_days" type="number" min="0"></label>
         </div>
+        <h2>Metadata scraping</h2>
+        <div class="grid">
+          <label>Retry unmatched/ambiguous items after (days)<input name="metadata_retry_unmatched_days" type="number" min="0"></label>
+        </div>
+        <p class="muted small">Scraper plugins are managed on the Metadata Scrapers page; each has its own settings.</p>
         <div class="toolbar"><button type="button" data-action="test-ffprobe">Test ffprobe</button><span id="ffprobe-result"></span></div>
         <h2>Logging &amp; history</h2>
         <div class="grid">

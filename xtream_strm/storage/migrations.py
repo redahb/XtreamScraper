@@ -193,6 +193,83 @@ _V1 = [
     "CREATE INDEX idx_probe_jobs_provider ON probe_jobs(provider_id, started_at)",
 ]
 
+# v2: metadata scraper framework
+_V2 = [
+    """
+    CREATE TABLE scraper_plugins (
+        plugin_id   TEXT PRIMARY KEY,
+        enabled     INTEGER NOT NULL DEFAULT 0,
+        overwrite   INTEGER NOT NULL DEFAULT 0,
+        priority    INTEGER NOT NULL,
+        installed_at TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE scraper_config (
+        plugin_id  TEXT PRIMARY KEY,
+        config     TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE scraper_bindings (
+        plugin_id              TEXT NOT NULL,
+        item_kind              TEXT NOT NULL CHECK (item_kind IN ('movie', 'series', 'season', 'episode')),
+        provider_id            INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        category_id            TEXT NOT NULL,
+        item_id                TEXT NOT NULL,
+        remote_id              TEXT,
+        remote_parent_id       TEXT,
+        season_number          INTEGER,
+        episode_number         INTEGER,
+        match_method           TEXT,
+        match_score            REAL,
+        matched_title          TEXT,
+        matched_year           INTEGER,
+        matched_at             TEXT,
+        last_successful_scrape TEXT,
+        last_attempt           TEXT,
+        status                 TEXT NOT NULL,
+        message                TEXT,
+        candidates             TEXT NOT NULL DEFAULT '[]',
+        config_fingerprint     TEXT,
+        PRIMARY KEY (plugin_id, item_kind, provider_id, category_id, item_id)
+    )
+    """,
+    "CREATE INDEX idx_scraper_bindings_provider ON scraper_bindings(provider_id, item_kind)",
+    """
+    CREATE TABLE metadata_jobs (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id           TEXT NOT NULL,
+        provider_id      INTEGER,
+        provider_name    TEXT NOT NULL,
+        scope            TEXT NOT NULL,
+        forced           INTEGER NOT NULL DEFAULT 0,
+        status           TEXT NOT NULL,
+        started_at       TEXT NOT NULL,
+        finished_at      TEXT,
+        duration_seconds REAL,
+        considered       INTEGER NOT NULL DEFAULT 0,
+        matched          INTEGER NOT NULL DEFAULT 0,
+        unmatched        INTEGER NOT NULL DEFAULT 0,
+        ambiguous        INTEGER NOT NULL DEFAULT 0,
+        updated          INTEGER NOT NULL DEFAULT 0,
+        unchanged        INTEGER NOT NULL DEFAULT 0,
+        skipped          INTEGER NOT NULL DEFAULT 0,
+        warning_count    INTEGER NOT NULL DEFAULT 0,
+        error_count      INTEGER NOT NULL DEFAULT 0,
+        plugins          TEXT NOT NULL DEFAULT '[]',
+        stats            TEXT NOT NULL DEFAULT '{}',
+        warnings         TEXT NOT NULL DEFAULT '[]',
+        errors           TEXT NOT NULL DEFAULT '[]',
+        details_pruned   INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX idx_metadata_jobs_provider ON metadata_jobs(provider_id, started_at)",
+]
+
 MIGRATIONS: list[Migration] = [
     (1, _V1),
+    (2, _V2),
 ]

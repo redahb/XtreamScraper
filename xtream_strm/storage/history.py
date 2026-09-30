@@ -22,7 +22,9 @@ DETAILED_JOBS_PER_PROVIDER = 20  # older jobs keep counters but lose message lis
 
 def _decode(row) -> dict[str, Any]:
     data = dict(row)
-    for key in ("stats", "warnings", "errors"):
+    for key in ("stats", "warnings", "errors", "plugins"):
+        if key not in data:
+            continue
         try:
             data[key] = json.loads(data.get(key) or ("{}" if key == "stats" else "[]"))
         except ValueError:
@@ -89,7 +91,14 @@ class _HistoryBase:
                 "ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
                 (provider_id, limit, offset),
             )
-        return [dict(r) for r in rows]
+        items = [dict(r) for r in rows]
+        for item in items:
+            if isinstance(item.get("plugins"), str):
+                try:
+                    item["plugins"] = json.loads(item["plugins"])
+                except ValueError:
+                    item["plugins"] = []
+        return items
 
     def _extra_list_columns(self) -> str:
         return ""
@@ -175,3 +184,15 @@ class ProbeHistoryRepository(_HistoryBase):
 
     def _extra_list_columns(self) -> str:
         return ", scope, forced"
+
+
+class MetadataHistoryRepository(_HistoryBase):
+    table = "metadata_jobs"
+    summary_columns = ("considered", "matched", "unmatched", "ambiguous", "updated", "unchanged", "skipped")
+
+    def _extra_list_columns(self) -> str:
+        return ", scope, forced, plugins"
+
+    def set_plugins(self, row_id: int, plugins: list[str]) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(f"UPDATE {self.table} SET plugins = ? WHERE id = ?", (json.dumps(plugins), row_id))

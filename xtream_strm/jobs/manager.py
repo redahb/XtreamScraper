@@ -19,7 +19,9 @@ from ..library.models import EPISODE, MOVIE
 from ..probe.engine import ProbeEngine, ProbeRequest, probe_summary_dict
 from ..probe.ffprobe_runner import locate_ffprobe
 from ..storage.db import Database
-from ..storage.history import ProbeHistoryRepository, SyncHistoryRepository
+from ..metadata.engine import ScrapeEngine, ScrapeRequest
+from ..metadata.manager import ScraperManager
+from ..storage.history import MetadataHistoryRepository, ProbeHistoryRepository, SyncHistoryRepository
 from ..storage.providers import Provider, ProviderRepository
 from ..sync.engine import SyncEngine, SyncRequest
 from ..utils.redact import redact
@@ -37,13 +39,16 @@ class BusyError(Exception):
 
 class JobManager:
     def __init__(self, db: Database, settings_store: SettingsStore, paths: AppPaths,
-                 client_factory: Optional[Callable] = None, probe_runner: Optional[Callable] = None) -> None:
+                 client_factory: Optional[Callable] = None, probe_runner: Optional[Callable] = None,
+                 scrapers: Optional["ScraperManager"] = None) -> None:
         self.db = db
         self.settings_store = settings_store
         self.paths = paths
         self.providers = ProviderRepository(db)
         self.sync_history = SyncHistoryRepository(db)
         self.probe_history = ProbeHistoryRepository(db)
+        self.metadata_history = MetadataHistoryRepository(db)
+        self.scrapers = scrapers
         self.client_factory = client_factory  # tests inject fake Xtream clients
         self.probe_runner = probe_runner  # tests inject a fake ffprobe
         self._jobs: "OrderedDict[str, JobProgress]" = OrderedDict()
@@ -258,10 +263,77 @@ class JobManager:
             statuses.append("failed")
         progress.finish(_overall(statuses), totals)
 
+    # -- metadata scraping ----------------------------------------------------------------------------
+    def start_scrape(self, provider_id: Optional[int], request: ScrapeRequest) -> JobProgress:
+        if self.scrapers is None:
+            raise RuntimeError("Metadata scraping is not available")
+        targets = self._targets(provider_id)
+        scope = {"all": "Movies + Series", "movies": "Movies", "series": "Series"}[request.scope]
+        who = targets[0].name if provider_id is not None else "all enabled providers"
+        progress = JobProgress("metadata", f"{'Force metadata refresh' if request.force else 'Scrape metadata'} {scope}: {who}")
+        self._register(progress)
+        self._spawn(self._run_scrape, progress, [p.id for p in targets], request)
+        return progress
+
+    def _run_scrape(self, progress: JobProgress, provider_ids: list[int], request: ScrapeRequest) -> None:
+        progress.start()
+        settings = self.settings_store.load()
+        statuses: list[str] = []
+        totals = {"considered": 0, "matched": 0, "unmatched": 0, "ambiguous": 0, "updated": 0, "unchanged": 0,
+                  "skipped": 0, "errors": 0}
+        try:
+            if not provider_ids:
+                progress.error("No enabled providers to scrape")
+            for pid in provider_ids:
+                if progress.cancelled:
+                    statuses.append("cancelled")
+                    break
+                provider = self.providers.get(pid)
+                if provider is None:
+                    continue
+                lock = self._lock_for(pid)
+                if not lock.acquire(blocking=False):
+                    progress.error(f"{provider.name}: another job is running for this provider; skipped")
+                    statuses.append("partial")
+                    continue
+                try:
+                    with self._lock:
+                        self._provider_activity[pid] = "scraping metadata"
+                    progress.update(provider=provider.name, processed=0, total=0)
+                    started = now_iso()
+                    row = self.metadata_history.start(progress.id, pid, provider.name, started,
+                                                      scope=request.scope, forced=int(request.force))
+                    progress.history_ids.append(row)
+                    engine = ScrapeEngine(self.db, settings, self.scrapers, progress)
+                    status, stats = engine.run(
+                        ScrapeRequest(provider_id=pid, kinds=request.kinds, force=request.force), provider.name)
+                    finished = now_iso()
+                    self.metadata_history.set_plugins(row, stats.plugins_used)
+                    self.metadata_history.finish(
+                        row, status, finished, seconds_between(started, finished) or 0.0,
+                        {**stats.counters(), "plugins": stats.plugins_used}, stats.warnings, stats.errors,
+                        stats.summary(),
+                    )
+                    statuses.append(status)
+                    for key, value in stats.summary().items():
+                        totals[key] += value
+                    totals["errors"] += stats.errors_count
+                finally:
+                    with self._lock:
+                        self._provider_activity.pop(pid, None)
+                    lock.release()
+            self._retention(settings)
+        except Exception as exc:
+            log.exception("Metadata job crashed")
+            progress.error(f"Metadata job crashed: {redact(exc)}")
+            statuses.append("failed")
+        progress.finish(_overall(statuses), totals)
+
     def _retention(self, settings: Settings) -> None:
         try:
             self.sync_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
             self.probe_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
+            self.metadata_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
         except Exception:
             log.exception("History retention failed")
 

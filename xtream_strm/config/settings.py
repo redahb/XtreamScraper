@@ -43,6 +43,8 @@ class Settings:
     probe_retry_failed_after_hours: int = 24
     probe_max_failed_attempts: int = 5
     probe_stale_days: int = 0  # 0 = never consider successful probes stale
+    # Metadata scraping: retry unmatched/ambiguous/missing items after this many days
+    metadata_retry_unmatched_days: int = 7
     # History retention
     history_keep_per_provider: int = 100
     history_max_age_days: int = 180
@@ -66,6 +68,7 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "probe_retry_failed_after_hours": (0, 8760),
     "probe_max_failed_attempts": (1, 1000),
     "probe_stale_days": (0, 3650),
+    "metadata_retry_unmatched_days": (0, 3650),
     "history_keep_per_provider": (5, 10000),
     "history_max_age_days": (1, 36500),
 }
