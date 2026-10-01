@@ -3,6 +3,10 @@
 The only code that writes descriptive-metadata XML. It replaces a tag group only when
 the model holds a meaningful value for it, so nothing is ever removed because a value is
 missing. ``<fileinfo>`` and tags outside the managed vocabulary are never touched.
+
+Media artwork (``<thumb>`` / ``<fanart>`` at NFO level) is not written here: the artwork
+manager decides whether artwork becomes a local file or a remote reference and writes
+references through :mod:`.artwork_refs`. Actor ``<thumb>`` images are part of ``<actor>``.
 """
 
 from __future__ import annotations
@@ -11,9 +15,9 @@ import xml.etree.ElementTree as ET
 from typing import Optional
 
 from ..metadata.merge import KEY_FUNCTIONS, dedupe, meaningful
-from ..metadata.models import ArtworkType, MetadataResult, PersonCredit
+from ..metadata.models import MetadataResult, PersonCredit
 from .document import NfoDocument
-from .metadata_vocabulary import DATE_TAG, MANAGED_ASPECTS, THUMB_ASPECT
+from .metadata_vocabulary import DATE_TAG
 from .paths import NfoKind
 
 
@@ -83,39 +87,8 @@ def _ratings(doc: NfoDocument, meta: MetadataResult) -> None:
     doc.replace_elements("ratings", [container])
 
 
-def _artwork(doc: NfoDocument, meta: MetadataResult, kind: NfoKind) -> None:
-    art = dedupe(meta.artwork or [], KEY_FUNCTIONS["artwork"])
-    thumbs = [a for a in art if a.type is not ArtworkType.FANART]
-    fanart = [a for a in art if a.type is ArtworkType.FANART]
-    if thumbs:
-        position = next((i for i, c in enumerate(doc.root) if c.tag == "thumb"), None)
-        for old in [c for c in doc.root.findall("thumb") if (c.get("aspect") or "").lower() in MANAGED_ASPECTS]:
-            doc.root.remove(old)
-        new = []
-        for a in thumbs:
-            if a.type is ArtworkType.SEASON_POSTER and kind is NfoKind.TVSHOW:
-                el = ET.Element("thumb", {"aspect": "poster", "type": "season", "season": str(a.season_number or 0)})
-            elif a.type is ArtworkType.STILL and kind is not NfoKind.EPISODE:
-                el = ET.Element("thumb", {"aspect": "landscape"})
-            else:
-                aspect = THUMB_ASPECT.get(a.type, "")
-                el = ET.Element("thumb", {"aspect": aspect} if aspect else {})
-            el.text = a.url
-            new.append(el)
-        if position is None or position > len(doc.root):
-            doc.root.extend(new)
-        else:
-            for offset, el in enumerate(new):
-                doc.root.insert(position + offset, el)
-    if fanart:
-        container = ET.Element("fanart")
-        for a in fanart:
-            ET.SubElement(container, "thumb").text = a.url
-        doc.replace_elements("fanart", [container])
-
-
 def apply_metadata(doc: NfoDocument, meta: MetadataResult) -> None:
-    """Write ``meta`` into ``doc``. ``<fileinfo>`` is never touched."""
+    """Write ``meta`` into ``doc``. ``<fileinfo>`` and media artwork are never touched."""
     kind = doc.kind or NfoKind.MOVIE
     _set(doc, "title", meta.title)
     _set(doc, "originaltitle", meta.original_title)
@@ -151,5 +124,4 @@ def apply_metadata(doc: NfoDocument, meta: MetadataResult) -> None:
     _ratings(doc, meta)
     _unique_ids(doc, meta)
     _actors(doc, meta.actors)
-    _artwork(doc, meta, kind)
     _set(doc, "trailer", meta.trailer)

@@ -58,6 +58,7 @@ function showTab(name) {
   if (name === "logs") loadLogs();
   if (name === "scrapers") loadScrapers();
   if (name === "metadata-history") loadMetadataHistory();
+  if (name === "artwork") { loadArtwork(); loadArtworkHistory(); }
   if (name === "about") loadAbout();
   if (name === "providers") renderProviders();
 }
@@ -447,7 +448,7 @@ async function openScraperConfig(id) {
   scraperPage.schema = data.schema;
   $("#scraper-config-title").textContent = `${data.name} Settings`;
   $("#scraper-config-result").textContent = "";
-  $("#scraper-config-fields").innerHTML = data.schema.map((f) => {
+  const field = (f) => {
     const value = data.values[f.key] ?? f.default ?? "";
     const help = f.help ? `<span class="small muted">${esc(f.help)}</span>` : "";
     if (f.type === "boolean") {
@@ -465,8 +466,23 @@ async function openScraperConfig(id) {
     const type = f.type === "integer" ? "number" : "text";
     const bounds = (f.minimum != null ? ` min="${f.minimum}"` : "") + (f.maximum != null ? ` max="${f.maximum}"` : "");
     return `<label>${esc(f.label)}<input type="${type}" name="${esc(f.key)}" value="${esc(value)}"${bounds}>${help}</label>`;
-  }).join("") || '<p class="muted">This scraper has no settings.</p>';
+  };
+  const basic = data.schema.filter((f) => !f.advanced);
+  const advanced = data.schema.filter((f) => f.advanced);
+  $("#scraper-config-fields").innerHTML = basic.map(field).join("") || '<p class="muted">This scraper has no settings.</p>';
+  $("#scraper-config-advanced-fields").innerHTML = advanced.map(field).join("");
+  $("#scraper-config-advanced").classList.toggle("hidden", !advanced.length);
+  $("#scraper-config-tests").innerHTML = (data.tests || []).map((t) =>
+    `<button type="button" data-action="scraper-test-extra" data-test="${esc(t.key)}">${esc(t.label)}</button>`).join(" ");
+  renderScraperStatus(data.status);
   showTab("scraper-config");
+}
+
+function renderScraperStatus(status) {
+  const entries = Object.entries(status || {});
+  $("#scraper-config-status").innerHTML = entries.length
+    ? `<strong>Status</strong><table><tbody>${entries.map(([k, v]) => `<tr><td class="muted">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}</tbody></table>`
+    : "";
 }
 
 function scraperFormValues() {
@@ -492,8 +508,9 @@ async function saveScraperConfig(ev) {
   }
 }
 
-async function testScraper(id, values) {
-  const res = await api("POST", `/scrapers/${encodeURIComponent(id)}/test`, values ? { values } : {});
+async function testScraper(id, values, test) {
+  const res = await api("POST", `/scrapers/${encodeURIComponent(id)}/test`, { ...(values ? { values } : {}), ...(test ? { test } : {}) });
+  if (id === scraperPage.id) renderScraperStatus(res.status);
   return `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
 }
 
@@ -508,6 +525,73 @@ async function loadMetadataHistory() {
     <td class="small">${(h.plugins || []).map(esc).join(", ")}</td>
     <td><button data-action="metadata-detail" data-id="${h.id}">Details</button></td></tr>`).join("")
     : '<tr><td colspan="15" class="muted">No metadata history.</td></tr>';
+}
+
+// ---------------------------------------------------------------------------------------
+// Artwork
+// ---------------------------------------------------------------------------------------
+const STATUS_LABELS = { ok: "ok", pending: "pending", external: "kept (not ours)", kept: "kept (newer available)",
+  modified: "changed outside app", disabled: "disabled", error: "error" };
+
+async function loadArtwork() {
+  const data = await api("GET", "/artwork");
+  const form = $("#artwork-form");
+  for (const input of form.elements) {
+    if (!input.name || !(input.name in data.settings)) continue;
+    const value = data.settings[input.name];
+    if (input.type === "radio") input.checked = input.value === value;
+    else if (input.type === "checkbox") input.checked = !!value;
+    else input.value = value;
+  }
+  const c = data.counts;
+  const slots = Object.entries(c.slots || {}).map(([k, v]) => `<div><span class="muted">${esc(STATUS_LABELS[k] || k)}:</span> ${v}</div>`).join("");
+  $("#artwork-counts").innerHTML = `<div><span class="muted">selected artwork:</span> ${c.slot_total}</div>${slots}
+    <div><span class="muted">managed local files:</span> ${c.managed_files}</div>
+    <div><span class="muted">protected (changed outside app):</span> ${c.modified_files}</div>
+    <div><span class="muted">managed NFO links:</span> ${c.nfo_refs}</div>`;
+}
+
+async function saveArtwork(ev) {
+  ev.preventDefault();
+  const body = {};
+  for (const input of $("#artwork-form").elements) {
+    if (!input.name) continue;
+    if (input.type === "radio") { if (input.checked) body[input.name] = input.value; }
+    else body[input.name] = input.type === "checkbox" ? input.checked : input.value;
+  }
+  try {
+    const res = await api("PUT", "/artwork/settings", body);
+    $("#artwork-result").textContent = res.job ? "Saved. Existing artwork is being reconciled in the background." : "Saved.";
+    toast(res.job ? `Started: ${res.job.description}` : "Artwork settings saved");
+    refreshStatus();
+    loadArtwork();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function startArtworkJob(force) {
+  if (force && !confirm("Replace artwork files this application downloaded, including ones changed outside the application?\n\nFiles you added yourself are never touched.")) return;
+  try {
+    const res = await api("POST", "/artwork/reconcile", force ? { force: true } : {});
+    toast(`Started: ${res.job.description}`);
+    refreshStatus();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function loadArtworkHistory() {
+  const pid = $("#artwork-history-provider").value;
+  const data = await api("GET", "/history/artwork" + (pid ? `?provider_id=${pid}` : ""));
+  $("#artwork-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
+    <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.mode)}${h.forced ? " (force)" : ""}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${h.considered}</td><td>${h.downloaded}</td><td>${h.nfo_urls_written}</td><td>${h.local_removed}</td>
+    <td>${h.nfo_refs_removed}</td><td>${h.unchanged}</td><td>${h.skipped}</td>
+    <td>${h.error_count ? `<span class="s-err">${h.error_count}</span>` : 0}</td>
+    <td><button data-action="artwork-detail" data-id="${h.id}">Details</button></td></tr>`).join("")
+    : '<tr><td colspan="14" class="muted">No artwork jobs yet.</td></tr>';
 }
 
 async function loadAbout() {
@@ -590,9 +674,17 @@ const actions = {
   "scraper-move": async (btn) => { await api("POST", `/scrapers/${encodeURIComponent(btn.dataset.id)}/move`, { direction: btn.dataset.dir }); loadScrapers(); },
   "scraper-configure": (btn) => openScraperConfig(btn.dataset.id),
   "scraper-test": async (btn) => { btn.disabled = true; try { const html = await testScraper(btn.dataset.id); toast(btn.closest("tr").querySelector("strong").textContent + ": " + html.replace(/<[^>]+>/g, "")); } finally { btn.disabled = false; } },
+  "scraper-test-extra": async (btn) => { $("#scraper-config-result").textContent = "Testing…"; $("#scraper-config-result").innerHTML = await testScraper(scraperPage.id, scraperFormValues(), btn.dataset.test); },
   "scraper-test-form": async () => { $("#scraper-config-result").textContent = "Testing…"; $("#scraper-config-result").innerHTML = await testScraper(scraperPage.id, scraperFormValues()); },
   "scraper-back": () => showTab("scrapers"),
   "reload-metadata-history": () => loadMetadataHistory(),
+  "reload-artwork-history": () => loadArtworkHistory(),
+  "artwork-reconcile": () => startArtworkJob(false),
+  "artwork-force": () => startArtworkJob(true),
+  "artwork-detail": async (btn) => {
+    const data = await api("GET", `/history/artwork/${btn.dataset.id}`);
+    const el = $("#artwork-detail"); el.innerHTML = detailHtml(data.item, "Artwork job"); el.classList.remove("hidden"); el.scrollIntoView({ behavior: "smooth" });
+  },
   "metadata-detail": async (btn) => {
     const data = await api("GET", `/history/metadata/${btn.dataset.id}`);
     const el = $("#metadata-detail"); el.innerHTML = detailHtml(data.item, "Metadata scrape"); el.classList.remove("hidden"); el.scrollIntoView({ behavior: "smooth" });
@@ -616,7 +708,8 @@ document.addEventListener("change", async (ev) => {
   } else if (t.dataset.cat) {
     updateCategoryCount(t.dataset.cat);
   } else if (t.classList.contains("provider-filter")) {
-    t.id.startsWith("sync") ? loadSyncHistory() : t.id.startsWith("probe") ? loadProbeHistory() : loadMetadataHistory();
+    t.id.startsWith("sync") ? loadSyncHistory() : t.id.startsWith("probe") ? loadProbeHistory()
+      : t.id.startsWith("artwork") ? loadArtworkHistory() : loadMetadataHistory();
   } else if (t.dataset.action === "scraper-enabled" || t.dataset.action === "scraper-overwrite") {
     const field = t.dataset.action === "scraper-enabled" ? "enabled" : "overwrite";
     try { await api("POST", `/scrapers/${encodeURIComponent(t.dataset.id)}/${field}`, { [field]: t.checked }); } catch (e) { toast(e.message, true); }
@@ -631,4 +724,5 @@ document.addEventListener("input", (ev) => {
 $("#provider-edit").addEventListener("submit", saveProvider);
 $("#settings-form").addEventListener("submit", saveSettings);
 $("#scraper-config-form").addEventListener("submit", saveScraperConfig);
+$("#artwork-form").addEventListener("submit", saveArtwork);
 refreshStatus();

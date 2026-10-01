@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Optional
 
-from ...models import (
+from xtream_strm.metadata.models import (
     Artwork,
     ArtworkType,
     Collection,
@@ -99,23 +99,40 @@ def _pick_images(items: list[dict], language: str, prefer_neutral: bool = False)
     return sorted((i for i in items if _s(i.get("file_path"))), key=rank)
 
 
+MAX_ART_CANDIDATES = 8
+
+
 def _artwork(details: dict, urls: ImageUrls, language: str, still: bool = False) -> list[Artwork]:
+    """Normalized artwork candidates (several per type); the core selects and stores the winner."""
     images = _d(details.get("images"))
     art: list[Artwork] = []
 
     def add(kind: ArtworkType, candidates: list[dict], fallback_path: Any = None) -> None:
-        chosen = candidates[0] if candidates else None
-        path = chosen.get("file_path") if chosen else fallback_path
-        url = urls.url(path)
-        if url:
-            art.append(Artwork(kind, url, language=(chosen or {}).get("iso_639_1"),
-                               width=int(chosen["width"]) if chosen and isinstance(chosen.get("width"), int) else None,
-                               height=int(chosen["height"]) if chosen and isinstance(chosen.get("height"), int) else None,
-                               rating=_num((chosen or {}).get("vote_average")), source="tmdb"))
+        added = 0
+        for image in candidates[:MAX_ART_CANDIDATES]:
+            url = urls.url(image.get("file_path"))
+            if not url:
+                continue
+            art.append(Artwork(kind, url, language=image.get("iso_639_1"),
+                               width=image["width"] if isinstance(image.get("width"), int) else None,
+                               height=image["height"] if isinstance(image.get("height"), int) else None,
+                               rating=_num(image.get("vote_average")),
+                               vote_count=int(_num(image.get("vote_count")) or 0) or None, source="tmdb"))
+            added += 1
+        if not added:
+            url = urls.url(fallback_path)
+            if url:
+                art.append(Artwork(kind, url, source="tmdb"))
 
     if still:
-        add(ArtworkType.STILL, _pick_images(_l(images.get("stills")), language, prefer_neutral=True), details.get("still_path"))
+        add(ArtworkType.EPISODE_STILL, _pick_images(_l(images.get("stills")), language, prefer_neutral=True),
+            details.get("still_path"))
         return art
+    add(ArtworkType.POSTER, _pick_images(_l(images.get("posters")), language), details.get("poster_path"))
+    add(ArtworkType.FANART, _pick_images(_l(images.get("backdrops")), language, prefer_neutral=True), details.get("backdrop_path"))
+    logos = [i for i in _pick_images(_l(images.get("logos")), language) if i.get("iso_639_1") in (_lang(language), None)]
+    add(ArtworkType.CLEARLOGO, logos)
+    return art
     add(ArtworkType.POSTER, _pick_images(_l(images.get("posters")), language), details.get("poster_path"))
     add(ArtworkType.FANART, _pick_images(_l(images.get("backdrops")), language, prefer_neutral=True), details.get("backdrop_path"))
     logos = [i for i in _pick_images(_l(images.get("logos")), language) if i.get("iso_639_1") in (_lang(language), None)]

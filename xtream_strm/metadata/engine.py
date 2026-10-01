@@ -14,6 +14,10 @@ Matching order, per plugin (the same for every plugin, owned by the core):
 Series are matched once; seasons and episodes are fetched with the series' remote ID
 plus the local season/episode numbers, never matched separately. Scraping never renames
 files and never touches ``<fileinfo>``.
+
+Artwork: every plugin's candidates are selected per slot with the same priority/overwrite
+rules (:mod:`.artwork_selection`) and handed to the core artwork manager, which stores the
+winner as a local file or a remote NFO reference. Plugins never write artwork themselves.
 """
 
 from __future__ import annotations
@@ -25,6 +29,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
+from ..artwork.download import ArtworkDownloader
+from ..artwork.manager import ArtworkManager
+from ..artwork.naming import ArtworkTarget
 from ..config.settings import Settings
 from ..filesystem import atomic
 from ..jobs.progress import JobCancelled, JobProgress
@@ -33,7 +40,7 @@ from ..library.models import EPISODE, MOVIE, LibraryItem, LibrarySeries
 from ..nfo.document import NfoDocument, NfoError
 from ..nfo.metadata_parser import parse_metadata
 from ..nfo.metadata_writer import apply_metadata
-from ..nfo.paths import NfoKind, season_nfo_path, tvshow_nfo_path
+from ..nfo.paths import NfoKind, tvshow_nfo_path
 from ..nfo.service import update_nfo
 from ..storage.db import Database
 from ..storage.scrapers import (
@@ -48,9 +55,10 @@ from ..storage.scrapers import (
 )
 from ..utils.redact import redact
 from ..utils.timeutil import now_iso, older_than
+from .artwork_selection import PluginArtwork, select_artwork
 from .manager import ActivePlugin, ScraperManager
 from .merge import descriptive_equal, meaningful, merge_into, snapshot
-from .models import MediaType, MetadataResult
+from .models import Artwork, ArtworkType, MediaType, MetadataResult
 from .plugin import Capability, ScraperSession
 from .results import FetchOutcome, FetchStatus, MatchMethod, MatchQuery, MatchStatus
 
@@ -86,6 +94,7 @@ class ScrapeStats:
     plugins_used: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    artwork: dict[str, int] = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
         if len(self.warnings) < MAX_MESSAGES:
@@ -97,7 +106,9 @@ class ScrapeStats:
             self.errors.append(redact(message))
 
     def counters(self) -> dict[str, int]:
-        return {k: v for k, v in asdict(self).items() if isinstance(v, int)}
+        counts = {k: v for k, v in asdict(self).items() if isinstance(v, int)}
+        counts.update({f"artwork_{k}": v for k, v in self.artwork.items() if k != "errors_count"})
+        return counts
 
     def summary(self) -> dict[str, int]:
         return {k: getattr(self, k) for k in
@@ -114,7 +125,8 @@ class PluginOutcome:
 
 
 class ScrapeEngine:
-    def __init__(self, db: Database, settings: Settings, manager: ScraperManager, progress: JobProgress) -> None:
+    def __init__(self, db: Database, settings: Settings, manager: ScraperManager, progress: JobProgress,
+                 library_root: str = "", artwork_downloader: Optional[ArtworkDownloader] = None) -> None:
         self.db = db
         self.settings = settings
         self.manager = manager
@@ -126,6 +138,10 @@ class ScrapeEngine:
         self.sessions: dict[str, ScraperSession] = {}
         self.retry_after = timedelta(days=max(0, settings.metadata_retry_unmatched_days))
         self.force = False
+        self.artwork = ArtworkManager(db, settings, library_root, downloader=artwork_downloader,
+                                      private_fetch=self._private_artwork)
+        # Season posters supplied with a series, per series target and plugin (this job only).
+        self._season_art: dict[tuple, dict[str, list[Artwork]]] = {}
 
     # -- entry point -------------------------------------------------------------------------------
     def run(self, request: ScrapeRequest, label: str = "") -> tuple[str, ScrapeStats]:
@@ -143,11 +159,20 @@ class ScrapeEngine:
             self.stats.error(f"Unexpected error: {exc}")
             log.exception("Unexpected metadata scrape error")
         finally:
+            self._report_sessions()
             for session in self.sessions.values():
                 try:
                     session.close()
                 except Exception:
                     log.exception("Closing scraper session failed")
+            self.artwork.close()
+        art = self.artwork.stats
+        self.stats.artwork = art.counters()
+        for message in art.errors:
+            self.stats.error(message)
+        self.stats.errors_count += art.errors_count - len(art.errors)
+        for message in art.warnings:
+            self.stats.warn(message)
         if status == "success" and self.stats.errors_count:
             status = "partial"
         if status == "success" and not self.active:
@@ -192,6 +217,28 @@ class ScrapeEngine:
             eps = episodes.get((show.provider_id, show.category_id, show.series_id), [])
             self._guard(show.title, lambda s=show, e=eps: self._series(s, e))
 
+    def _report_sessions(self) -> None:
+        """Job-wide plugin conditions (suspension) become one warning; status is persisted."""
+        for pid, session in self.sessions.items():
+            if session.suspended:
+                self.stats.warn(session.suspended)
+            try:
+                update = session.status_update()
+                if update:
+                    self.manager.record_status(pid, update)
+            except Exception:
+                log.exception("Recording the status of scraper %s failed", pid)
+
+    def _suspended(self, plugin_id: str) -> bool:
+        session = self.sessions.get(plugin_id)
+        return session is None or bool(session.suspended)
+
+    def _private_artwork(self, plugin_id: str, download_ref: str):
+        """Authenticated artwork bytes from a plugin session (local downloads only)."""
+        if self._suspended(plugin_id):
+            return None
+        return self.sessions[plugin_id].fetch_artwork(download_ref)
+
     def _guard(self, label: str, action: Callable[[], None]) -> None:
         """One failing item never stops the job."""
         try:
@@ -218,13 +265,56 @@ class ScrapeEngine:
             return older_than(binding.last_attempt, self.retry_after)
         return True  # api_error or unknown
 
-    def _item_needs(self, key: tuple, nfo_path: str) -> bool:
+    def _item_needs(self, key: tuple, nfo_path: str, target: ArtworkTarget) -> bool:
         exists = atomic.is_file(nfo_path)
-        return any(self._needs(ap, key, exists) for ap in self.active)
+        if any(self._needs(ap, key, exists) for ap in self.active):
+            return True
+        # Items scraped before artwork management existed have no artwork selection yet.
+        return not self.artwork.was_evaluated(target)
+
+    # -- artwork ----------------------------------------------------------------------------------------
+    def _candidates(self, target: ArtworkTarget, art: Optional[list[Artwork]]) -> list[Artwork]:
+        """Candidates that belong to ``target`` (season posters get the local season number)."""
+        result = []
+        for a in art or []:
+            kind = ArtworkType(a.type)
+            if target.item_kind == "season":
+                if kind in (ArtworkType.POSTER, ArtworkType.SEASON_POSTER) and a.season_number in (None, target.season):
+                    result.append(Artwork(**{**asdict(a), "type": ArtworkType.SEASON_POSTER,
+                                             "season_number": target.season}))
+            elif target.item_kind == "episode":
+                if kind is ArtworkType.EPISODE_STILL:
+                    result.append(a)
+            elif kind not in (ArtworkType.SEASON_POSTER, ArtworkType.EPISODE_STILL, ArtworkType.PERSON_IMAGE):
+                result.append(a)
+        return result
+
+    def _select_artwork(self, target: ArtworkTarget, outcomes: list[PluginOutcome],
+                        extra: dict[str, list[Artwork]]) -> dict:
+        per_plugin, reported = [], set()
+        season_art: dict[str, list[Artwork]] = {}
+        for ap in self.active:
+            pid = ap.plugin.plugin_id
+            outcome = next((o for o in outcomes if o.plugin_id == pid), None)
+            candidates: list[Artwork] = []
+            remote_id = None
+            if outcome is not None and outcome.status == MATCHED and outcome.metadata is not None:
+                reported.add(pid)
+                art = outcome.metadata.artwork
+                candidates = self._candidates(target, art)
+                remote_id = outcome.binding.remote_id if outcome.binding else None
+                if target.item_kind == "series":
+                    season_art[pid] = [a for a in art or [] if ArtworkType(a.type) is ArtworkType.SEASON_POSTER]
+            candidates += self._candidates(target, extra.get(pid))
+            per_plugin.append(PluginArtwork(pid, ap.state.overwrite, candidates, ap.config.get("language"), remote_id))
+        if target.item_kind == "series":
+            self._season_art[target.key] = season_art
+        return select_artwork(per_plugin, self.artwork.stored_selection(target), reported)
 
     # -- the pipeline ---------------------------------------------------------------------------------
     def _pipeline(self, label: str, nfo_path: str, kind: NfoKind, outcomes_for: Callable[[MetadataResult], list[PluginOutcome]],
-                  local_fill: Callable[[MetadataResult], None]) -> list[PluginOutcome]:
+                  local_fill: Callable[[MetadataResult], None], target: ArtworkTarget,
+                  extra_art: Optional[dict[str, list[Artwork]]] = None) -> list[PluginOutcome]:
         exists = atomic.is_file(nfo_path)
         try:
             existing = parse_metadata(NfoDocument.load(nfo_path, kind), kind) if exists \
@@ -232,6 +322,7 @@ class ScrapeEngine:
         except NfoError as exc:
             self.stats.error(f"{label}: existing NFO cannot be read, left untouched: {exc}")
             return []
+        existing.artwork = None  # artwork references are owned by the artwork manager
         result = snapshot(existing)
         outcomes = outcomes_for(existing)
         for ap in self.active:  # merge strictly in priority order
@@ -246,14 +337,32 @@ class ScrapeEngine:
             merge_into(result, meta, overwrite=ap.state.overwrite)
         local_fill(result)
         self._count(label, outcomes)
-        if descriptive_equal(result, existing) or (not exists and not any(o.status == MATCHED for o in outcomes)):
+
+        # Artwork: select per slot, let the artwork manager download/plan before the NFO write.
+        selections = self._select_artwork(target, outcomes, extra_art or {})
+        plan = self.artwork.prepare(target, selections)
+        own_edit = plan.edit_for(nfo_path)
+        describe = not descriptive_equal(result, existing) and (exists or any(o.status == MATCHED for o in outcomes))
+        if not describe:
             self.stats.unchanged += 1
-            return outcomes
-        try:
-            update_nfo(nfo_path, kind, lambda doc: apply_metadata(doc, result))
-            self.stats.updated += 1
-        except (NfoError, OSError) as exc:
-            self.stats.error(f"{label}: NFO write failed: {exc}")
+        written: dict[str, bool] = {}
+        if describe or own_edit is not None:
+            def mutate(doc: NfoDocument) -> None:
+                if describe:
+                    apply_metadata(doc, result)
+                if own_edit is not None:
+                    own_edit.apply(doc)
+
+            try:
+                update_nfo(nfo_path, kind, mutate)
+                written[nfo_path] = True
+                if describe:
+                    self.stats.updated += 1
+            except (NfoError, OSError) as exc:
+                written[nfo_path] = False
+                self.stats.error(f"{label}: NFO write failed: {exc}")
+        self.artwork.complete(plan, written)
+        self.artwork.mark_evaluated(target)
         return outcomes
 
     def _count(self, label: str, outcomes: list[PluginOutcome]) -> None:
@@ -290,8 +399,13 @@ class ScrapeEngine:
             return FetchOutcome.error(f"plugin error: {exc}")
 
     def _resolve_root(self, ap: ActivePlugin, key: tuple, media: str, title: str, year: Optional[int],
-                      existing: MetadataResult) -> PluginOutcome:
+                      existing: MetadataResult, found_ids: Optional[dict[str, str]] = None) -> PluginOutcome:
+        """``found_ids``: external IDs higher-priority plugins supplied for this item in this job.
+        They are used like NFO IDs (after them), so e.g. an IMDb ID found by one plugin spares
+        another plugin a title search."""
         pid = ap.plugin.plugin_id
+        if self._suspended(pid):
+            return PluginOutcome(pid, UNSUPPORTED)  # skipped for this job; nothing recorded
         session = self.sessions[pid]
         fetch = session.get_movie if media == "movie" else session.get_series
         match = session.match_movie if media == "movie" else session.match_series
@@ -324,21 +438,27 @@ class ScrapeEngine:
             invalid_id = old.remote_id
             log.info("%s: stored %s binding %s no longer exists; matching again", title, pid, invalid_id)
 
-        # 2. ID already present in the NFO for this plugin's namespace
+        # 2. ID already present in the NFO for this plugin's namespace (or supplied by a
+        #    higher-priority plugin during this job)
         namespace = ap.plugin.id_namespace
+        found_ids = found_ids or {}
         nfo_id = existing.external_ids.get(namespace) if namespace else None
+        method = MatchMethod.NFO_UNIQUEID
+        if namespace and (not nfo_id or nfo_id == invalid_id) and found_ids.get(namespace):
+            nfo_id, method = found_ids[namespace], MatchMethod.EXTERNAL_ID
         if nfo_id and nfo_id != invalid_id:
             outcome = self._call(lambda: fetch(nfo_id), pid)
             if outcome.status is FetchStatus.OK:
-                return success(nfo_id, outcome, MatchMethod.NFO_UNIQUEID.value)
+                return success(nfo_id, outcome, method.value)
             if outcome.status is FetchStatus.API_ERROR:
                 return failed(API_ERROR, outcome.message, remote_id=None)
             if outcome.status is FetchStatus.UNSUPPORTED:
                 return PluginOutcome(pid, UNSUPPORTED)
 
         # 3./4. plugin matching (external IDs, then title/year)
+        known = {**found_ids, **existing.external_ids}
         query = MatchQuery(media_type=media, title=title, year=year,
-                           external_ids={k: v for k, v in existing.external_ids.items() if k != namespace or v != invalid_id})
+                           external_ids={k: v for k, v in known.items() if k != namespace or v != invalid_id})
         result = self._call(lambda: match(query), pid)
         status = getattr(result, "status", None)
         if status is MatchStatus.UNSUPPORTED or status is FetchStatus.UNSUPPORTED:
@@ -366,8 +486,8 @@ class ScrapeEngine:
     def _resolve_child(self, ap: ActivePlugin, key: tuple, series_remote: Optional[str], season: int,
                        episode: Optional[int]) -> Optional[PluginOutcome]:
         pid = ap.plugin.plugin_id
-        if not series_remote:
-            return None  # this plugin did not match the series
+        if not series_remote or self._suspended(pid):
+            return None  # this plugin did not match the series, or is skipped for this job
         session = self.sessions[pid]
         if episode is None:
             outcome = self._call(lambda: session.get_season(series_remote, season), pid)
@@ -391,39 +511,46 @@ class ScrapeEngine:
     # -- movies ------------------------------------------------------------------------------------------
     def _movie(self, item: LibraryItem) -> None:
         key = ("movie", item.provider_id, item.category_id, item.item_id)
-        if not self._item_needs(key, item.nfo_path):
+        target = ArtworkTarget.for_movie(item)
+        if not self._item_needs(key, item.nfo_path, target):
             self.stats.skipped += 1
             return
 
         def outcomes(existing: MetadataResult) -> list[PluginOutcome]:
-            result = []
+            result, found = [], {}
             for ap in self.active:
                 if not ap.plugin.supports(Capability.MOVIES):
                     continue
-                result.append(self._resolve_root(ap, key, "movie", item.title, item.year, existing))
+                result.append(self._resolve_root(ap, key, "movie", item.title, item.year, existing, found))
+                _collect_ids(found, result[-1])
             return result
 
         def fill(meta: MetadataResult) -> None:
             if not meaningful(meta.title):
                 meta.title = item.title
 
-        self._pipeline(item.label, item.nfo_path, NfoKind.MOVIE, outcomes, fill)
+        self._pipeline(item.label, item.nfo_path, NfoKind.MOVIE, outcomes, fill, target)
 
     # -- series ------------------------------------------------------------------------------------------
     def _series(self, show: LibrarySeries, episodes: list[LibraryItem]) -> None:
         key = ("series", show.provider_id, show.category_id, show.series_id)
         nfo = tvshow_nfo_path(show.folder_path)
         series_remote: dict[str, Optional[str]] = {}
-        if self._item_needs(key, nfo):
+        show_target = ArtworkTarget.for_series(show)
+        if self._item_needs(key, nfo, show_target):
             def outcomes(existing: MetadataResult) -> list[PluginOutcome]:
-                return [self._resolve_root(ap, key, "series", show.title, show.year, existing)
-                        for ap in self.active if ap.plugin.supports(Capability.SERIES)]
+                result, found = [], {}
+                for ap in self.active:
+                    if ap.plugin.supports(Capability.SERIES):
+                        result.append(self._resolve_root(ap, key, "series", show.title, show.year, existing, found))
+                        _collect_ids(found, result[-1])
+                return result
 
             def fill(meta: MetadataResult) -> None:
                 if not meaningful(meta.title):
                     meta.title = show.title
 
-            for o in self._pipeline(show.title, nfo, NfoKind.TVSHOW, outcomes, fill):
+            for o in self._pipeline(show.title, nfo, NfoKind.TVSHOW, outcomes, fill, show_target):
                 if o.status == MATCHED and o.binding:
                     series_remote[o.plugin_id] = o.binding.remote_id
         else:
@@ -444,8 +571,9 @@ class ScrapeEngine:
             eps = by_season[season]
             folder = os.path.dirname(eps[0].strm_path)
             season_key = ("season", show.provider_id, show.category_id, f"{show.series_id}/{season}")
+            season_target = ArtworkTarget.for_season(show, folder, season)
             self._guard(f"{show.title} season {season}",
-                        lambda k=season_key, f=folder, s=season: self._season(k, f, s, series_remote))
+                        lambda k=season_key, t=season_target, s=season: self._season(k, t, s, series_remote))
             self.progress.advance()
             for ep in sorted(eps, key=lambda e: e.episode or 0):
                 self.progress.check_cancelled()
@@ -459,9 +587,9 @@ class ScrapeEngine:
         except NfoError:
             return None
 
-    def _season(self, key: tuple, folder: str, season: int, series_remote: dict[str, Optional[str]]) -> None:
-        nfo = season_nfo_path(folder)
-        if not self._item_needs(key, nfo):
+    def _season(self, key: tuple, target: ArtworkTarget, season: int, series_remote: dict[str, Optional[str]]) -> None:
+        nfo = target.nfo_path
+        if not self._item_needs(key, nfo, target):
             self.stats.skipped += 1
             return
 
@@ -477,11 +605,14 @@ class ScrapeEngine:
         def fill(meta: MetadataResult) -> None:
             meta.season_number = season
 
-        self._pipeline(f"season {season}", nfo, NfoKind.SEASON, outcomes, fill)
+        show_key = (target.key[0], "series", target.key[2], target.key[3].rsplit("/", 1)[0])
+        self._pipeline(f"season {season}", nfo, NfoKind.SEASON, outcomes, fill, target,
+                       self._season_art.get(show_key))
 
     def _episode(self, ep: LibraryItem, series_remote: dict[str, Optional[str]], series_title: str) -> None:
         key = ("episode", ep.provider_id, ep.category_id, ep.item_id)
-        if not self._item_needs(key, ep.nfo_path):
+        target = ArtworkTarget.for_episode(ep)
+        if not self._item_needs(key, ep.nfo_path, target):
             self.stats.skipped += 1
             return
         season, number = ep.season or 0, ep.episode or 0
@@ -501,7 +632,16 @@ class ScrapeEngine:
             if not meaningful(meta.show_title):
                 meta.show_title = series_title
 
-        self._pipeline(ep.label, ep.nfo_path, NfoKind.EPISODE, outcomes, fill)
+        self._pipeline(ep.label, ep.nfo_path, NfoKind.EPISODE, outcomes, fill, target)
+
+
+def _collect_ids(found: dict[str, str], outcome: PluginOutcome) -> None:
+    """Remember the external IDs a matched plugin supplied (first plugin wins per namespace)."""
+    if outcome.status == MATCHED and outcome.metadata is not None:
+        for namespace, value in outcome.metadata.external_ids.items():
+            key, value = (namespace or "").strip().lower(), str(value or "").strip()
+            if key and value and key not in found:
+                found[key] = value
 
 
 def _media_type(kind: NfoKind) -> MediaType:

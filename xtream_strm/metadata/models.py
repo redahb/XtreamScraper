@@ -24,14 +24,25 @@ class MediaType(str, enum.Enum):
 
 
 class ArtworkType(str, enum.Enum):
+    """Normalized, provider-independent artwork types.
+
+    Scraper adapters map their own field names (``poster_path``, ``backdrop_path``...)
+    onto these; nothing outside an adapter sees provider-specific names.
+    """
+
     POSTER = "poster"
     FANART = "fanart"  # backdrop
-    LOGO = "logo"
+    CLEARLOGO = "clearlogo"
     BANNER = "banner"
     LANDSCAPE = "landscape"
     CLEARART = "clearart"
-    STILL = "still"  # episode still / thumbnail
+    KEYART = "keyart"  # portrait artwork without the title/logo (unlike POSTER)
     SEASON_POSTER = "season_poster"
+    EPISODE_STILL = "episode_still"  # episode thumbnail
+    PERSON_IMAGE = "person_image"  # actor/person images travel in PersonCredit.profile_image
+    # Aliases kept for readability in older code and plugins.
+    LOGO = "clearlogo"
+    STILL = "episode_still"
 
 
 @dataclass
@@ -47,14 +58,34 @@ class PersonCredit:
 
 @dataclass
 class Artwork:
+    """One normalized artwork candidate supplied by a scraper plugin.
+
+    Plugins may return several candidates per type; the core selects the winner
+    (:mod:`.artwork_selection`) and the artwork manager decides how it is stored.
+    """
+
     type: ArtworkType
     url: str
-    language: Optional[str] = None
+    language: Optional[str] = None  # ISO 639-1; None = language-neutral (no text)
     width: Optional[int] = None
     height: Optional[int] = None
     rating: Optional[float] = None
     source: Optional[str] = None
-    season_number: Optional[int] = None  # for season posters in tvshow.nfo
+    season_number: Optional[int] = None  # for season posters supplied with a series
+    vote_count: Optional[int] = None
+    #: Optional opaque reference the plugin's session can turn into an authenticated
+    #: download (:meth:`~.plugin.ScraperSession.fetch_artwork`), e.g. a higher-resolution
+    #: image behind the plugin's credentials. It holds no secret. The core uses it only for
+    #: local downloads, never persists it and never writes it to an NFO; ``url`` stays the
+    #: public, persistable candidate and the fallback.
+    download_ref: Optional[str] = None
+    # Set by the core during selection (provenance), never by plugins.
+    source_plugin: Optional[str] = None
+    source_remote_id: Optional[str] = None
+    provider_priority: Optional[int] = None
+
+
+ArtworkCandidate = Artwork
 
 
 @dataclass

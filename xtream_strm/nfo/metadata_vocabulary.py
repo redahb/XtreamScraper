@@ -19,12 +19,13 @@ DATE_TAG = {
 # <thumb aspect="..."> values for artwork types written as root-level <thumb> elements.
 THUMB_ASPECT = {
     ArtworkType.POSTER: "poster",
-    ArtworkType.LOGO: "clearlogo",
+    ArtworkType.CLEARLOGO: "clearlogo",
     ArtworkType.BANNER: "banner",
     ArtworkType.LANDSCAPE: "landscape",
     ArtworkType.CLEARART: "clearart",
+    ArtworkType.KEYART: "keyart",
     ArtworkType.SEASON_POSTER: "poster",
-    ArtworkType.STILL: "",
+    ArtworkType.EPISODE_STILL: "",
 }
 ASPECT_TO_TYPE = {
     "poster": ArtworkType.POSTER,
@@ -34,6 +35,5 @@ ASPECT_TO_TYPE = {
     "landscape": ArtworkType.LANDSCAPE,
     "thumb": ArtworkType.LANDSCAPE,
     "clearart": ArtworkType.CLEARART,
+    "keyart": ArtworkType.KEYART,
 }
-#: <thumb> aspects the core manages; thumbs with any other aspect are left untouched.
-MANAGED_ASPECTS = {"", "poster", "clearlogo", "logo", "banner", "landscape", "thumb", "clearart"}

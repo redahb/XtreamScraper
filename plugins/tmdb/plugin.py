@@ -12,9 +12,9 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
-from ....core.matching import MatchCandidate, TitleMatcher
-from ...models import MetadataResult
-from ...plugin import (
+from xtream_strm.core.matching import MatchCandidate, TitleMatcher
+from xtream_strm.metadata.models import MetadataResult
+from xtream_strm.metadata.plugin import (
     Attribution,
     Capability,
     ConfigError,
@@ -24,7 +24,7 @@ from ...plugin import (
     ScraperSession,
     validate_against_schema,
 )
-from ...results import FetchOutcome, MatchMethod, MatchOutcome, MatchQuery
+from xtream_strm.metadata.results import FetchOutcome, MatchMethod, MatchOutcome, MatchQuery
 from .client import TMDBAuthError, TMDBClient, TMDBError, TMDBNotFound
 from .mapping import (
     ImageUrls,

@@ -3,10 +3,12 @@
 * Overwrite OFF: a non-empty destination value is kept; empty destination values are
   filled. Collections gain the plugin's unique values after the existing ones.
 * Overwrite ON: meaningful plugin values replace destination values; collections are
-  replaced when the plugin supplies a non-empty collection (artwork per artwork type).
+  replaced when the plugin supplies a non-empty collection.
 * In both modes a missing, empty or invalid plugin value never erases anything.
 * External IDs and ratings are keyed by source: a plugin only ever adds or (with
   overwrite) updates its own keys; other sources' IDs/ratings are untouched.
+* Artwork is not merged here: candidates are selected per slot by
+  :mod:`.artwork_selection` and stored by the core artwork manager.
 """
 
 from __future__ import annotations
@@ -121,18 +123,15 @@ def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool) -> se
             changed.add(name)
 
     for name in LIST_FIELDS:
+        if name == "artwork":
+            continue  # selected by artwork_selection, stored by the artwork manager
         key_fn = KEY_FUNCTIONS[name]
         incoming = dedupe(getattr(src, name) or [], key_fn)
         if not incoming:
             continue
         current = list(getattr(dest, name) or [])
         if overwrite:
-            if name == "artwork":
-                replaced_types = {(a.type, a.season_number) for a in incoming}
-                kept = [a for a in current if (a.type, a.season_number) not in replaced_types]
-                merged = kept + incoming
-            else:
-                merged = incoming
+            merged = incoming
         else:
             seen: set = set()
             merged = dedupe(current, key_fn, seen) + dedupe(incoming, key_fn, seen)

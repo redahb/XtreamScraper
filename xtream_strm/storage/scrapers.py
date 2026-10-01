@@ -68,7 +68,11 @@ class ScraperStateRepository:
 
     # -- manager state -------------------------------------------------------------------------
     def ensure_installed(self, plugin_ids: Iterable[str]) -> None:
-        """Give newly installed plugins a row (disabled, overwrite off, last priority)."""
+        """Give newly installed plugins a row: disabled, overwrite off, at the bottom of the list.
+
+        Plugins that appear at the same time are appended by plugin ID, so the order never
+        depends on how or when plugins were loaded. After that only the user changes it.
+        """
         now = now_iso()
         with self.db.transaction() as conn:
             existing = {r["plugin_id"] for r in conn.execute("SELECT plugin_id FROM scraper_plugins")}
@@ -125,6 +129,33 @@ class ScraperStateRepository:
                 "ON CONFLICT(plugin_id) DO UPDATE SET config = excluded.config, updated_at = excluded.updated_at",
                 (plugin_id, json.dumps(config), now_iso()),
             )
+
+    # -- plugin status -------------------------------------------------------------------------
+    def get_status(self, plugin_id: str) -> dict[str, Any]:
+        row = self.db.query_one("SELECT status, updated_at FROM scraper_status WHERE plugin_id = ?", (plugin_id,))
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["status"])
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def update_status(self, plugin_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        """Merge ``values`` into the stored status (a ``None`` value removes that entry)."""
+        status = self.get_status(plugin_id)
+        for key, value in values.items():
+            if value is None:
+                status.pop(key, None)
+            else:
+                status[key] = value
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO scraper_status(plugin_id, status, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(plugin_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                (plugin_id, json.dumps(status), now_iso()),
+            )
+        return status
 
     # -- bindings / per-item scrape state --------------------------------------------------------
     def get_binding(self, plugin_id: str, item_kind: str, provider_id: int, category_id: str,

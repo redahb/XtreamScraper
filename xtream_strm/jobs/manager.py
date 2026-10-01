@@ -1,4 +1,4 @@
-"""Background sync/probe jobs.
+"""Background sync/probe/metadata/artwork jobs.
 
 Each job runs in its own thread so the web server stays responsive. A per-provider lock
 guarantees that one provider is never synchronized (or probed) by two jobs at once;
@@ -12,6 +12,7 @@ import threading
 from collections import OrderedDict
 from typing import Callable, Optional
 
+from ..artwork.reconcile import ArtworkReconciler, effective_root
 from ..config.paths import AppPaths
 from ..config.settings import Settings, SettingsStore
 from ..filesystem.layout import provider_folder_names
@@ -21,7 +22,12 @@ from ..probe.ffprobe_runner import locate_ffprobe
 from ..storage.db import Database
 from ..metadata.engine import ScrapeEngine, ScrapeRequest
 from ..metadata.manager import ScraperManager
-from ..storage.history import MetadataHistoryRepository, ProbeHistoryRepository, SyncHistoryRepository
+from ..storage.history import (
+    ArtworkHistoryRepository,
+    MetadataHistoryRepository,
+    ProbeHistoryRepository,
+    SyncHistoryRepository,
+)
 from ..storage.providers import Provider, ProviderRepository
 from ..sync.engine import SyncEngine, SyncRequest
 from ..utils.redact import redact
@@ -48,6 +54,7 @@ class JobManager:
         self.sync_history = SyncHistoryRepository(db)
         self.probe_history = ProbeHistoryRepository(db)
         self.metadata_history = MetadataHistoryRepository(db)
+        self.artwork_history = ArtworkHistoryRepository(db)
         self.scrapers = scrapers
         self.client_factory = client_factory  # tests inject fake Xtream clients
         self.probe_runner = probe_runner  # tests inject a fake ffprobe
@@ -304,7 +311,8 @@ class JobManager:
                     row = self.metadata_history.start(progress.id, pid, provider.name, started,
                                                       scope=request.scope, forced=int(request.force))
                     progress.history_ids.append(row)
-                    engine = ScrapeEngine(self.db, settings, self.scrapers, progress)
+                    root = effective_root(provider.target_folder, settings.default_target_folder)
+                    engine = ScrapeEngine(self.db, settings, self.scrapers, progress, library_root=root)
                     status, stats = engine.run(
                         ScrapeRequest(provider_id=pid, kinds=request.kinds, force=request.force), provider.name)
                     finished = now_iso()
@@ -329,11 +337,79 @@ class JobManager:
             statuses.append("failed")
         progress.finish(_overall(statuses), totals)
 
+    # -- artwork reconciliation ---------------------------------------------------------------------
+    def start_artwork(self, provider_id: Optional[int], force: bool = False) -> JobProgress:
+        """Reconcile existing artwork with the current artwork settings (every provider by default)."""
+        if provider_id is not None:
+            targets = self._targets(provider_id)
+        else:
+            targets = self.providers.list()
+        mode = self.settings_store.load().artwork_mode
+        who = targets[0].name if provider_id is not None else "all providers"
+        progress = JobProgress("artwork", f"{'Force replace managed artwork' if force else 'Reconcile artwork'} "
+                                          f"({mode}): {who}")
+        self._register(progress)
+        self._spawn(self._run_artwork, progress, [p.id for p in targets], force)
+        return progress
+
+    def _run_artwork(self, progress: JobProgress, provider_ids: list[int], force: bool) -> None:
+        progress.start()
+        settings = self.settings_store.load()
+        statuses: list[str] = []
+        totals = {"considered": 0, "downloaded": 0, "nfo_urls_written": 0, "local_removed": 0,
+                  "nfo_refs_removed": 0, "unchanged": 0, "skipped": 0, "errors": 0}
+        try:
+            if not provider_ids:
+                statuses.append("success")  # nothing to reconcile
+            for pid in provider_ids:
+                if progress.cancelled:
+                    statuses.append("cancelled")
+                    break
+                provider = self.providers.get(pid)
+                if provider is None:
+                    continue
+                lock = self._lock_for(pid)
+                if not lock.acquire(blocking=False):
+                    progress.error(f"{provider.name}: another job is running for this provider; skipped")
+                    statuses.append("partial")
+                    continue
+                try:
+                    with self._lock:
+                        self._provider_activity[pid] = "reconciling artwork"
+                    progress.update(provider=provider.name, processed=0, total=0)
+                    started = now_iso()
+                    row = self.artwork_history.start(progress.id, pid, provider.name, started,
+                                                     mode=settings.artwork_mode, forced=int(force))
+                    progress.history_ids.append(row)
+                    root = effective_root(provider.target_folder, settings.default_target_folder)
+                    engine = ArtworkReconciler(self.db, settings, progress, root)
+                    status, stats = engine.run(pid, provider.name, force=force)
+                    finished = now_iso()
+                    self.artwork_history.finish(
+                        row, status, finished, seconds_between(started, finished) or 0.0,
+                        stats.counters(), stats.warnings, stats.errors, stats.summary(),
+                    )
+                    statuses.append(status)
+                    for key, value in stats.summary().items():
+                        totals[key] += value
+                    totals["errors"] += stats.errors_count
+                finally:
+                    with self._lock:
+                        self._provider_activity.pop(pid, None)
+                    lock.release()
+            self._retention(settings)
+        except Exception as exc:
+            log.exception("Artwork job crashed")
+            progress.error(f"Artwork job crashed: {redact(exc)}")
+            statuses.append("failed")
+        progress.finish(_overall(statuses), totals)
+
     def _retention(self, settings: Settings) -> None:
         try:
             self.sync_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
             self.probe_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
             self.metadata_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
+            self.artwork_history.apply_retention(settings.history_keep_per_provider, settings.history_max_age_days)
         except Exception:
             log.exception("History retention failed")
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import abc
 import enum
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ..core.matching.models import ScoringProfile
 from .results import FetchOutcome, MatchOutcome, MatchQuery, MatchStatus
@@ -63,6 +63,7 @@ class ConfigField:
     maximum: Optional[float] = None
     choices: list[tuple[str, str]] = field(default_factory=list)  # (value, label)
     pattern_hint: str = ""
+    advanced: bool = False  # shown in the page's "Advanced" section
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +71,7 @@ class ConfigField:
             "default": None if self.type is FieldType.SECRET else self.default,
             "required": self.required, "help": self.help, "minimum": self.minimum,
             "maximum": self.maximum, "choices": [{"value": v, "label": l} for v, l in self.choices],
+            "advanced": self.advanced,
         }
 
 
@@ -108,8 +110,38 @@ def validate_against_schema(schema: list[ConfigField], values: dict[str, Any]) -
     return clean
 
 
+@dataclass
+class ArtworkPayload:
+    """Image bytes a session fetched for an :attr:`~.models.Artwork.download_ref`.
+
+    The core validates the payload and writes the file; the plugin never does.
+    """
+
+    data: bytes
+    content_type: str = ""
+
+
+@dataclass
+class TestAction:
+    """An additional test button on the plugin's settings page (besides Test Connection)."""
+
+    key: str
+    label: str
+
+
+#: What a connection test returns: ``(ok, message)`` or ``(ok, message, status)``. ``status``
+#: entries are merged into the plugin's persisted status (see :meth:`ScraperSession.status_update`).
+TestResult = Union[tuple[bool, str], tuple[bool, str, dict[str, Any]]]
+
+
 class ScraperSession(abc.ABC):
     """Per-job worker. Default implementations report the operation as unsupported."""
+
+    #: Set by a session that must not be called again during this job (e.g. the source's
+    #: request quota is exhausted or its credentials were rejected). The message is safe
+    #: to show. The core then skips the plugin for the remaining items, records nothing
+    #: for them (so the next job tries again) and lets lower-priority plugins continue.
+    suspended: Optional[str] = None
 
     def match_movie(self, query: MatchQuery) -> MatchOutcome:
         return MatchOutcome(MatchStatus.UNSUPPORTED)
@@ -128,6 +160,22 @@ class ScraperSession(abc.ABC):
 
     def get_episode(self, series_remote_id: str, season_number: int, episode_number: int) -> FetchOutcome:
         return FetchOutcome.unsupported()
+
+    def fetch_artwork(self, download_ref: str) -> Optional[ArtworkPayload]:
+        """Bytes for an artwork candidate's ``download_ref``, or ``None`` when unavailable.
+
+        Only the core artwork manager calls this, for local downloads; it falls back to the
+        candidate's public ``url`` on ``None``, an exception or an invalid payload.
+        Authenticated URLs built here must never be returned, logged or persisted.
+        """
+        return None
+
+    def status_update(self) -> dict[str, Any]:
+        """Status entries to persist when the job ends (e.g. "Last successful request").
+
+        Values must be plain, secret-free strings; ``None`` removes an entry.
+        """
+        return {}
 
     def close(self) -> None:
         """Release connections/caches at the end of the job."""
@@ -158,9 +206,16 @@ class ScraperPlugin(abc.ABC):
     def is_configured(self, config: dict[str, Any]) -> bool:
         return all(config.get(f.key) not in (None, "") for f in self.config_schema() if f.required)
 
-    def test_connection(self, config: dict[str, Any]) -> tuple[bool, str]:
+    def test_connection(self, config: dict[str, Any]) -> TestResult:
         """Make a lightweight authenticated request. Messages must never contain secrets."""
         return True, "Nothing to test"
+
+    def extra_tests(self) -> list[TestAction]:
+        """Further tests offered on the settings page (run through :meth:`run_test`)."""
+        return []
+
+    def run_test(self, key: str, config: dict[str, Any]) -> TestResult:
+        raise KeyError(key)
 
     @abc.abstractmethod
     def create_session(self, config: dict[str, Any]) -> ScraperSession:

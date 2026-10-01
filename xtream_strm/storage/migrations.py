@@ -269,7 +269,117 @@ _V2 = [
     "CREATE INDEX idx_metadata_jobs_provider ON metadata_jobs(provider_id, started_at)",
 ]
 
+# v3: core artwork management – persisted selection per artwork slot, ownership of local
+# artwork files and of remote NFO references, and artwork job history.
+_V3 = [
+    """
+    CREATE TABLE artwork_items (
+        provider_id  INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        item_kind    TEXT NOT NULL CHECK (item_kind IN ('movie', 'series', 'season', 'episode')),
+        category_id  TEXT NOT NULL,
+        item_id      TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        PRIMARY KEY (provider_id, item_kind, category_id, item_id)
+    )
+    """,
+    """
+    CREATE TABLE artwork_slots (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_id      INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        item_kind        TEXT NOT NULL CHECK (item_kind IN ('movie', 'series', 'season', 'episode')),
+        category_id      TEXT NOT NULL,
+        item_id          TEXT NOT NULL,
+        artwork_type     TEXT NOT NULL,
+        source_plugin    TEXT,
+        source_remote_id TEXT,
+        source_url       TEXT NOT NULL,
+        language         TEXT,
+        width            INTEGER,
+        height           INTEGER,
+        selected_at      TEXT NOT NULL,
+        mode             TEXT,
+        status           TEXT NOT NULL DEFAULT 'pending',
+        message          TEXT,
+        updated_at       TEXT NOT NULL,
+        UNIQUE (provider_id, item_kind, category_id, item_id, artwork_type)
+    )
+    """,
+    "CREATE INDEX idx_artwork_slots_provider ON artwork_slots(provider_id, item_kind)",
+    """
+    CREATE TABLE artwork_files (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_id       INTEGER NOT NULL REFERENCES artwork_slots(id) ON DELETE CASCADE,
+        role          TEXT NOT NULL CHECK (role IN ('primary', 'alias')),
+        local_path    TEXT NOT NULL,
+        file_hash     TEXT NOT NULL,
+        size          INTEGER NOT NULL,
+        source_url    TEXT NOT NULL,
+        source_plugin TEXT,
+        status        TEXT NOT NULL DEFAULT 'managed',
+        downloaded_at TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        UNIQUE (slot_id, local_path)
+    )
+    """,
+    """
+    CREATE TABLE artwork_nfo_refs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_id       INTEGER NOT NULL REFERENCES artwork_slots(id) ON DELETE CASCADE,
+        nfo_path      TEXT NOT NULL,
+        nfo_kind      TEXT NOT NULL,
+        location      TEXT NOT NULL,
+        url           TEXT NOT NULL,
+        source_plugin TEXT,
+        written_at    TEXT NOT NULL,
+        UNIQUE (slot_id, nfo_path, location, url)
+    )
+    """,
+    "CREATE INDEX idx_artwork_refs_nfo ON artwork_nfo_refs(nfo_path, location)",
+    """
+    CREATE TABLE artwork_jobs (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id            TEXT NOT NULL,
+        provider_id       INTEGER,
+        provider_name     TEXT NOT NULL,
+        mode              TEXT NOT NULL,
+        forced            INTEGER NOT NULL DEFAULT 0,
+        status            TEXT NOT NULL,
+        started_at        TEXT NOT NULL,
+        finished_at       TEXT,
+        duration_seconds  REAL,
+        considered        INTEGER NOT NULL DEFAULT 0,
+        downloaded        INTEGER NOT NULL DEFAULT 0,
+        nfo_urls_written  INTEGER NOT NULL DEFAULT 0,
+        local_removed     INTEGER NOT NULL DEFAULT 0,
+        nfo_refs_removed  INTEGER NOT NULL DEFAULT 0,
+        unchanged         INTEGER NOT NULL DEFAULT 0,
+        skipped           INTEGER NOT NULL DEFAULT 0,
+        warning_count     INTEGER NOT NULL DEFAULT 0,
+        error_count       INTEGER NOT NULL DEFAULT 0,
+        stats             TEXT NOT NULL DEFAULT '{}',
+        warnings          TEXT NOT NULL DEFAULT '[]',
+        errors            TEXT NOT NULL DEFAULT '[]',
+        details_pruned    INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX idx_artwork_jobs_provider ON artwork_jobs(provider_id, started_at)",
+]
+
+# v4: plugin status reported by scrape jobs and connection tests (e.g. "request quota
+# exhausted"), shown on the plugin's settings page. Never contains secrets.
+_V4 = [
+    """
+    CREATE TABLE scraper_status (
+        plugin_id   TEXT PRIMARY KEY,
+        status      TEXT NOT NULL DEFAULT '{}',
+        updated_at  TEXT NOT NULL
+    )
+    """,
+]
+
 MIGRATIONS: list[Migration] = [
     (1, _V1),
     (2, _V2),
+    (3, _V3),
+    (4, _V4),
 ]

@@ -45,6 +45,24 @@ class Settings:
     probe_stale_days: int = 0  # 0 = never consider successful probes stale
     # Metadata scraping: retry unmatched/ambiguous/missing items after this many days
     metadata_retry_unmatched_days: int = 7
+    # Artwork (core artwork manager; applies to every scraper plugin)
+    artwork_mode: str = "local"  # local | remote | disabled
+    artwork_movie_poster: bool = True
+    artwork_movie_fanart: bool = True
+    artwork_show_poster: bool = True
+    artwork_show_fanart: bool = True
+    artwork_season_poster: bool = True
+    artwork_episode_still: bool = True
+    artwork_clearlogo: bool = False
+    artwork_banner: bool = False
+    artwork_landscape: bool = False
+    artwork_keyart: bool = False
+    artwork_existing: str = "keep"  # keep | replace_managed
+    artwork_aliases: bool = True  # SeasonXX.jpg / <episode>.jpg compatibility copies
+    artwork_keep_previous: bool = False  # keep the previous representation when the mode changes
+    artwork_timeout_seconds: int = 30
+    artwork_retries: int = 3
+    artwork_max_size_mb: int = 20
     # History retention
     history_keep_per_provider: int = 100
     history_max_age_days: int = 180
@@ -69,9 +87,25 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "probe_max_failed_attempts": (1, 1000),
     "probe_stale_days": (0, 3650),
     "metadata_retry_unmatched_days": (0, 3650),
+    "artwork_timeout_seconds": (5, 600),
+    "artwork_retries": (0, 10),
+    "artwork_max_size_mb": (1, 200),
     "history_keep_per_provider": (5, 10000),
     "history_max_age_days": (1, 36500),
 }
+
+
+_CHOICES: dict[str, tuple[str, ...]] = {
+    "artwork_mode": ("local", "remote", "disabled"),
+    "artwork_existing": ("keep", "replace_managed"),
+}
+
+#: Settings whose change requires artwork reconciliation of the existing library.
+ARTWORK_RECONCILE_KEYS = (
+    "artwork_mode", "artwork_movie_poster", "artwork_movie_fanart", "artwork_show_poster", "artwork_show_fanart",
+    "artwork_season_poster", "artwork_episode_still", "artwork_clearlogo", "artwork_banner", "artwork_landscape",
+    "artwork_keyart", "artwork_existing", "artwork_aliases",
+)
 
 
 class SettingsError(ValueError):
@@ -104,6 +138,10 @@ def coerce_settings(values: Mapping[str, Any], base: Settings | None = None) -> 
             low, high = _BOUNDS[f.name]
             if not low <= value <= high:
                 raise SettingsError(f"{f.name} must be between {low:g} and {high:g}")
+        if f.name in _CHOICES:
+            value = str(value).lower()
+            if value not in _CHOICES[f.name]:
+                raise SettingsError(f"{f.name} must be one of {', '.join(_CHOICES[f.name])}")
         if f.name == "log_level":
             value = str(value).upper()
             if value not in LOG_LEVELS:

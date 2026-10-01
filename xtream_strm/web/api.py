@@ -12,7 +12,8 @@ from typing import Any, Optional
 from flask import Blueprint, jsonify, request
 
 from .. import __version__
-from ..config.settings import SettingsError
+from ..config.settings import ARTWORK_RECONCILE_KEYS, Settings, SettingsError
+from ..storage.artwork import ArtworkRepository
 from ..context import AppContext
 from ..jobs.manager import KIND_SCOPES, BusyError
 from ..metadata.engine import ScrapeRequest
@@ -375,12 +376,16 @@ def build_api(ctx: AppContext) -> Blueprint:
 
     @api.post("/scrapers/<plugin_id>/test")
     def test_scraper(plugin_id: str):
-        values = _body().get("values")
+        body = _body()
+        values, test = body.get("values"), body.get("test")
+        if test is not None and not isinstance(test, str):
+            return _error("'test' must be a string")
         try:
-            ok, message = ctx.scrapers.test(plugin_id, values if isinstance(values, dict) else None)
+            ok, message = ctx.scrapers.test(plugin_id, values if isinstance(values, dict) else None, test)
         except KeyError:
-            return not_installed()
-        return jsonify(ok=ok, message=message)
+            return _error("Unknown test", 404) if test is not None and ctx.scrapers.registry.get(plugin_id) \
+                else not_installed()
+        return jsonify(ok=ok, message=message, status=ctx.scrapers.status(plugin_id))
 
     @api.post("/metadata/scrape")
     def start_scrape():
@@ -400,6 +405,57 @@ def build_api(ctx: AppContext) -> Blueprint:
     @api.get("/about")
     def about():
         return jsonify(version=__version__, attributions=ctx.scrapers.attributions() if ctx.scrapers else [])
+
+    # -- artwork ------------------------------------------------------------------------------------
+    def artwork_view(settings: Settings) -> dict:
+        return {k: v for k, v in settings.to_dict().items() if k.startswith("artwork_")}
+
+    def reconcile_if_changed(previous: Settings, settings: Settings) -> Optional[dict]:
+        """A changed artwork mode/type/alias setting reconciles the existing library (background job)."""
+        if all(getattr(previous, k) == getattr(settings, k) for k in ARTWORK_RECONCILE_KEYS):
+            return None
+        if not ctx.providers.list():
+            return None
+        job = ctx.jobs.start_artwork(None)
+        log.info("Artwork settings changed (mode %s); reconciliation started", settings.artwork_mode)
+        return job.to_dict()
+
+    @api.get("/artwork")
+    def artwork_overview():
+        settings = ctx.settings_store.load()
+        return jsonify(settings=artwork_view(settings), counts=ArtworkRepository(ctx.db).counts())
+
+    @api.put("/artwork/settings")
+    def save_artwork_settings():
+        body = {k: v for k, v in _body().items() if k.startswith("artwork_")}
+        previous = ctx.settings_store.load()
+        try:
+            settings = ctx.settings_store.save(body)
+        except SettingsError as exc:
+            return _error(str(exc))
+        job = reconcile_if_changed(previous, settings)
+        return jsonify(settings=artwork_view(settings), job=job)
+
+    @api.post("/artwork/reconcile")
+    def reconcile_artwork():
+        body = _body()
+        try:
+            job = ctx.jobs.start_artwork(_provider_arg(body), force=_bool(body.get("force")))
+        except KeyError:
+            return _error("Provider not found", 404)
+        except BusyError as exc:
+            return _error(str(exc), 409)
+        return jsonify(job=job.to_dict()), 202
+
+    @api.get("/history/artwork")
+    def artwork_history():
+        pid, limit, offset = _limits()
+        return jsonify(items=ctx.jobs.artwork_history.list(pid, limit, offset))
+
+    @api.get("/history/artwork/<int:row_id>")
+    def artwork_history_item(row_id: int):
+        item = ctx.jobs.artwork_history.get(row_id)
+        return jsonify(item=item) if item else _error("Not found", 404)
 
     # -- settings / diagnostics -------------------------------------------------------------------
     @api.get("/settings")
@@ -421,7 +477,8 @@ def build_api(ctx: AppContext) -> Blueprint:
         logging_setup.set_level(settings.log_level)
         restart = settings.web_port != previous.web_port or settings.web_host != previous.web_host
         log.info("Settings saved%s", " (restart required for web server changes)" if restart else "")
-        return jsonify(settings=settings.to_dict(), restart_required=restart)
+        job = reconcile_if_changed(previous, settings)
+        return jsonify(settings=settings.to_dict(), restart_required=restart, artwork_job=job)
 
     @api.post("/settings/test-ffprobe")
     def test_ffprobe():

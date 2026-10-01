@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from ..storage.db import Database
 from ..storage.scrapers import PluginState, ScraperStateRepository
@@ -76,6 +76,7 @@ class ScraperManager:
                 "capabilities": sorted(c.value for c in plugin.capabilities),
                 "attribution": ({"text": plugin.attribution.text, "url": plugin.attribution.url}
                                 if plugin.attribution else None),
+                "status": self.status(plugin.plugin_id),
             })
         return items
 
@@ -117,6 +118,8 @@ class ScraperManager:
             "values": values,
             "secrets": secrets,
             "configured": plugin.is_configured(config),
+            "tests": [{"key": t.key, "label": t.label} for t in plugin.extra_tests()],
+            "status": self.status(plugin_id),
         }
 
     def _merged(self, plugin: ScraperPlugin, values: dict[str, Any]) -> dict[str, Any]:
@@ -143,20 +146,40 @@ class ScraperManager:
         log.info("Scraper plugin %s configuration saved", plugin_id)
         return self.public_config(plugin_id)
 
-    def test(self, plugin_id: str, values: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
-        """Test with the stored config, or with unsaved form values merged over it."""
+    def test(self, plugin_id: str, values: Optional[dict[str, Any]] = None,
+             test: Optional[str] = None) -> tuple[bool, str]:
+        """Test with the stored config, or with unsaved form values merged over it.
+
+        ``test`` selects one of the plugin's :meth:`~.plugin.ScraperPlugin.extra_tests`
+        instead of the connection test (``KeyError`` when the plugin has no such test).
+        """
         plugin = self._plugin(plugin_id)
+        if test is not None and test not in {t.key for t in plugin.extra_tests()}:
+            raise KeyError(test)
         try:
             config = plugin.validate_config(self._merged(plugin, values or {}))
         except ConfigError as exc:
             return False, str(exc)
         secrets = [config.get(f.key) for f in plugin.config_schema() if f.type is FieldType.SECRET]
         try:
-            ok, message = plugin.test_connection(config)
+            result = plugin.run_test(test, config) if test is not None else plugin.test_connection(config)
         except Exception as exc:  # a plugin bug must not leak a traceback with secrets
             log.warning("Scraper plugin %s test failed: %s", plugin_id, redact(exc, secrets))
             return False, redact(f"Test failed: {exc}", secrets)
+        ok, message = result[0], result[1]
+        if len(result) > 2 and isinstance(result[2], dict):
+            self.record_status(plugin_id, result[2], secrets)
         return bool(ok), redact(message, secrets)
+
+    # -- plugin status ----------------------------------------------------------------------------
+    def status(self, plugin_id: str) -> dict[str, Any]:
+        return self.state.get_status(plugin_id)
+
+    def record_status(self, plugin_id: str, values: dict[str, Any], secrets: Iterable[Optional[str]] = ()) -> None:
+        """Persist status entries reported by a test or a scrape job (redacted, never secrets)."""
+        clean = {str(k): (None if v is None else redact(v, secrets)) for k, v in values.items()}
+        if clean:
+            self.state.update_status(plugin_id, clean)
 
     # -- scrape time ----------------------------------------------------------------------------------
     def config_fingerprint(self, plugin: ScraperPlugin, config: dict[str, Any]) -> str:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -10,8 +9,7 @@ from .config.paths import AppPaths
 from .config.settings import SettingsStore
 from .jobs.manager import JobManager
 from .metadata.manager import ScraperManager
-from .metadata.plugins import register_builtin
-from .metadata.registry import registry
+from .metadata.registry import PluginRegistry
 from .storage.categories import CategoryRepository
 from .storage.db import Database
 from .storage.history import MetadataHistoryRepository, ProbeHistoryRepository, SyncHistoryRepository
@@ -41,7 +39,7 @@ class AppContext:
 
 
 def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[Callable] = None,
-                  probe_runner: Optional[Callable] = None) -> AppContext:
+                  probe_runner: Optional[Callable] = None, registry: Optional[PluginRegistry] = None) -> AppContext:
     db = Database(paths.db_path)
     db.migrate()
     settings_store = SettingsStore(db)
@@ -50,11 +48,14 @@ def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[
     sync_history = SyncHistoryRepository(db)
     probe_history = ProbeHistoryRepository(db)
     metadata_history = MetadataHistoryRepository(db)
+    from .storage.history import ArtworkHistoryRepository
+
     interrupted = (sync_history.mark_interrupted() + probe_history.mark_interrupted()
-                   + metadata_history.mark_interrupted())
-    # Scraper plugins: bundled ones (TMDB) plus drop-ins from <app>/plugins/*.py
-    register_builtin(registry)
-    registry.discover(os.path.join(paths.root, "plugins"))
+                   + metadata_history.mark_interrupted() + ArtworkHistoryRepository(db).mark_interrupted())
+    # Scraper plugins: nothing is built in; whatever is installed in <app>/plugins/ is loaded.
+    if registry is None:
+        registry = PluginRegistry()
+        registry.discover(paths.plugins_dir)
     scrapers = ScraperManager(db, registry)
     jobs = JobManager(db, settings_store, paths, client_factory=client_factory, probe_runner=probe_runner,
                       scrapers=scrapers)

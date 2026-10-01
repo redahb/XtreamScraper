@@ -69,6 +69,7 @@ class MatchOutcome:
     matched_year: Optional[int] = None
     candidates: list[Candidate] = field(default_factory=list)
     message: Optional[str] = None
+    format_error: bool = False  # see FetchOutcome.format_error
 
     @classmethod
     def matched(cls, remote_id: str, method: MatchMethod, score: Optional[float] = None,
@@ -86,6 +87,10 @@ class MatchOutcome:
     @classmethod
     def error(cls, message: str) -> "MatchOutcome":
         return cls(MatchStatus.API_ERROR, message=message)
+
+    @classmethod
+    def provider_format_error(cls, message: str) -> "MatchOutcome":
+        return cls(MatchStatus.API_ERROR, message=message, format_error=True)
 
     @classmethod
     def from_decision(cls, decision: "MatchDecision", method: MatchMethod, max_candidates: int = 5) -> "MatchOutcome":
@@ -109,6 +114,10 @@ class FetchOutcome:
     metadata: Optional[MetadataResult] = None
     remote_id: Optional[str] = None  # e.g. the remote episode ID
     message: Optional[str] = None
+    #: The source answered, but in a format the plugin no longer understands (e.g. a
+    #: changed page structure). Handled like an API error: the item is *not* reported as
+    #: missing and its binding is kept, so a fixed plugin picks it up again.
+    format_error: bool = False
 
     @classmethod
     def ok(cls, metadata: MetadataResult, remote_id: Optional[str] = None) -> "FetchOutcome":
@@ -121,6 +130,11 @@ class FetchOutcome:
     @classmethod
     def error(cls, message: str) -> "FetchOutcome":
         return cls(FetchStatus.API_ERROR, message=message)
+
+    @classmethod
+    def provider_format_error(cls, message: str) -> "FetchOutcome":
+        """The provider's response format changed or could not be parsed (never "not found")."""
+        return cls(FetchStatus.API_ERROR, message=message, format_error=True)
 
     @classmethod
     def unsupported(cls) -> "FetchOutcome":

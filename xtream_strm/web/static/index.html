@@ -16,6 +16,7 @@
       <button data-tab="probe-history">Probe history</button>
       <button data-tab="scrapers">Metadata Scrapers</button>
       <button data-tab="metadata-history">Metadata history</button>
+      <button data-tab="artwork">Artwork</button>
       <button data-tab="settings">Settings</button>
       <button data-tab="logs">Logs</button>
       <button data-tab="about">About</button>
@@ -173,9 +174,13 @@
       <form id="scraper-config-form" class="card" autocomplete="off">
         <h2 id="scraper-config-title">Scraper settings</h2>
         <div class="grid" id="scraper-config-fields"></div>
+        <details id="scraper-config-advanced" class="hidden"><summary>Advanced</summary>
+          <div class="grid" id="scraper-config-advanced-fields"></div></details>
+        <div id="scraper-config-status" class="small"></div>
         <div class="toolbar">
           <button type="submit" class="primary">Save</button>
           <button type="button" data-action="scraper-test-form">Test Connection</button>
+          <span id="scraper-config-tests"></span>
           <button type="button" data-action="scraper-back">Back to Metadata Scrapers</button>
           <span id="scraper-config-result"></span>
         </div>
@@ -197,6 +202,81 @@
         </table>
       </div>
       <div id="metadata-detail" class="card hidden"></div>
+    </section>
+
+    <!-- Artwork -->
+    <section id="tab-artwork" class="tab hidden">
+      <form id="artwork-form" class="card" autocomplete="off">
+        <h2>Artwork mode</h2>
+        <div class="options">
+          <label><input type="radio" name="artwork_mode" value="local"> <strong>Local artwork</strong> (recommended) –
+            images are downloaded next to the media files with standard names (poster.jpg, fanart.jpg…)</label>
+          <label><input type="radio" name="artwork_mode" value="remote"> <strong>Remote URLs in NFO</strong> –
+            nothing is downloaded; image links are written into the NFO files</label>
+          <label><input type="radio" name="artwork_mode" value="disabled"> <strong>Disabled</strong> –
+            stop adding or changing artwork; existing artwork is kept</label>
+        </div>
+        <p class="muted small">Changing the mode migrates artwork this application manages in the background: the new
+          representation is created and verified first, then the previous one is removed. Artwork the application did
+          not create (your own poster.jpg, existing NFO links) is never deleted or overwritten.</p>
+        <h2>Artwork types</h2>
+        <div class="checks">
+          <label><input type="checkbox" name="artwork_movie_poster"> Movie posters</label>
+          <label><input type="checkbox" name="artwork_movie_fanart"> Movie fanart</label>
+          <label><input type="checkbox" name="artwork_show_poster"> TV show posters</label>
+          <label><input type="checkbox" name="artwork_show_fanart"> TV show fanart</label>
+          <label><input type="checkbox" name="artwork_season_poster"> Season posters</label>
+          <label><input type="checkbox" name="artwork_episode_still"> Episode stills</label>
+          <label><input type="checkbox" name="artwork_clearlogo"> Clear logos</label>
+          <label><input type="checkbox" name="artwork_banner"> Banners</label>
+          <label><input type="checkbox" name="artwork_landscape"> Landscape</label>
+          <label><input type="checkbox" name="artwork_keyart"> Key art</label>
+        </div>
+        <h2>Local files</h2>
+        <div class="grid">
+          <label>Existing local artwork
+            <select name="artwork_existing">
+              <option value="keep">Keep existing</option>
+              <option value="replace_managed">Replace managed artwork</option>
+            </select>
+            <span class="small muted">"Replace" only ever replaces files this application downloaded and that were not
+              changed since.</span>
+          </label>
+          <label>Download timeout (s)<input name="artwork_timeout_seconds" type="number" min="5" max="600"></label>
+          <label>Download retries<input name="artwork_retries" type="number" min="0" max="10"></label>
+          <label>Maximum image size (MB)<input name="artwork_max_size_mb" type="number" min="1" max="200"></label>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" name="artwork_aliases"> Cross-player compatibility aliases
+            (Season 01\Season01.jpg besides poster.jpg; &lt;episode&gt;.jpg besides &lt;episode&gt;-thumb.jpg)</label>
+          <label><input type="checkbox" name="artwork_keep_previous"> Keep previous artwork representation when
+            changing mode (advanced)</label>
+        </div>
+        <div class="toolbar">
+          <button type="submit" class="primary">Save artwork settings</button>
+          <button type="button" data-action="artwork-reconcile">Reconcile now</button>
+          <button type="button" data-action="artwork-force">Force replace managed artwork</button>
+          <span id="artwork-result"></span>
+        </div>
+      </form>
+      <div class="card">
+        <h2>Artwork state</h2>
+        <div id="artwork-counts" class="stats"></div>
+      </div>
+      <h2>Artwork jobs</h2>
+      <div class="toolbar">
+        <label>Provider <select id="artwork-history-provider" class="provider-filter"></select></label>
+        <button data-action="reload-artwork-history">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Provider</th><th>Started</th><th>Mode</th><th>Duration</th><th>Result</th>
+            <th>Considered</th><th>Downloaded</th><th>NFO URLs written</th><th>Local removed</th>
+            <th>NFO refs removed</th><th>Unchanged</th><th>Skipped</th><th>Errors</th><th></th></tr></thead>
+          <tbody id="artwork-history"></tbody>
+        </table>
+      </div>
+      <div id="artwork-detail" class="card hidden"></div>
     </section>
 
     <!-- About -->

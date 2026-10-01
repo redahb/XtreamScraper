@@ -21,6 +21,11 @@ def app_root() -> str:
 class AppPaths:
     root: str
     data_dir: str
+    plugins: Optional[str] = None  # scraper plugin folder; defaults to <app>/plugins
+
+    @property
+    def plugins_dir(self) -> str:
+        return self.plugins or os.path.join(self.root, "plugins")
 
     @property
     def db_path(self) -> str:
@@ -35,8 +40,9 @@ class AppPaths:
         os.makedirs(self.log_dir, exist_ok=True)
 
 
-def resolve_paths(data_dir: Optional[str] = None) -> AppPaths:
+def resolve_paths(data_dir: Optional[str] = None, plugins_dir: Optional[str] = None) -> AppPaths:
     """Data directory priority: explicit argument > environment variable > ``<app>/data``."""
     root = app_root()
     chosen = data_dir or os.environ.get(DATA_DIR_ENV) or os.path.join(root, "data")
-    return AppPaths(root=root, data_dir=os.path.abspath(chosen))
+    return AppPaths(root=root, data_dir=os.path.abspath(chosen),
+                    plugins=os.path.abspath(plugins_dir) if plugins_dir else None)

@@ -78,7 +78,15 @@ class TitleMatcher:
 
     def decide(self, title: str, year: Optional[int], candidates: Iterable[MatchCandidate],
                threshold: float) -> MatchDecision:
-        ranked = self.rank(title, year, candidates)
+        return self.decide_ranked(self.rank(title, year, candidates), threshold)
+
+    def decide_ranked(self, ranked: list[ScoredCandidate], threshold: float) -> MatchDecision:
+        """The threshold/ambiguity decision over candidates already scored by :meth:`rank`.
+
+        For plugins that must drop some ranked candidates first (e.g. after confirming each
+        one's media type): the kept candidates keep their shared scores and order.
+        """
+        ranked = sorted(ranked, key=self._order_key)
         if not ranked:
             return MatchDecision(Decision.UNMATCHED, None, ranked, threshold, "no candidates")
         best = ranked[0]

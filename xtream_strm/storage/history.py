@@ -1,4 +1,4 @@
-"""Synchronization and probe job history (user-visible statistics), with retention.
+"""Synchronization, probe, metadata and artwork job history (user-visible statistics), with retention.
 
 This is separate from the synchronization state: deleting history never affects what
 the next sync considers new or unchanged.
@@ -196,3 +196,12 @@ class MetadataHistoryRepository(_HistoryBase):
     def set_plugins(self, row_id: int, plugins: list[str]) -> None:
         with self.db.transaction() as conn:
             conn.execute(f"UPDATE {self.table} SET plugins = ? WHERE id = ?", (json.dumps(plugins), row_id))
+
+
+class ArtworkHistoryRepository(_HistoryBase):
+    table = "artwork_jobs"
+    summary_columns = ("considered", "downloaded", "nfo_urls_written", "local_removed", "nfo_refs_removed",
+                       "unchanged", "skipped")
+
+    def _extra_list_columns(self) -> str:
+        return ", mode, forced"

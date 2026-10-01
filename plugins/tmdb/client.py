@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from .... import APP_NAME, __version__
+from xtream_strm import APP_NAME, __version__
 
 log = logging.getLogger(__name__)
 
