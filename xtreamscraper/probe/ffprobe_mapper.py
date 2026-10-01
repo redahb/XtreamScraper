@@ -1,7 +1,7 @@
 """ffprobe JSON -> normalized :class:`MediaInfo`.
 
 The only ffprobe-specific interpretation in the application. It fills the core model and
-nothing else; how that model becomes XML is decided by :mod:`xtream_strm.nfo`.
+nothing else; how that model becomes XML is decided by :mod:`xtreamscraper.nfo`.
 Values are taken only when ffprobe gives clear evidence; everything else stays unset.
 """
 

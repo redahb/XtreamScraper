@@ -1,7 +1,7 @@
 """TMDB scraper plugin.
 
 Responsibilities: TMDB API behaviour, external-ID lookup, search, conversion of search
-results into shared :class:`~xtream_strm.core.matching.MatchCandidate` objects, and
+results into shared :class:`~xtreamscraper.core.matching.MatchCandidate` objects, and
 mapping details to the normalized model. Fuzzy matching, merging, bindings and NFO
 writing are done by the core.
 """
@@ -12,9 +12,9 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
-from xtream_strm.core.matching import MatchCandidate, TitleMatcher
-from xtream_strm.metadata.models import MetadataResult
-from xtream_strm.metadata.plugin import (
+from xtreamscraper.core.matching import MatchCandidate, TitleMatcher
+from xtreamscraper.metadata.models import MetadataResult
+from xtreamscraper.metadata.plugin import (
     Attribution,
     Capability,
     ConfigError,
@@ -24,7 +24,7 @@ from xtream_strm.metadata.plugin import (
     ScraperSession,
     validate_against_schema,
 )
-from xtream_strm.metadata.results import FetchOutcome, MatchMethod, MatchOutcome, MatchQuery
+from xtreamscraper.metadata.results import FetchOutcome, MatchMethod, MatchOutcome, MatchQuery
 from .client import TMDBAuthError, TMDBClient, TMDBError, TMDBNotFound
 from .mapping import (
     ImageUrls,
@@ -186,7 +186,7 @@ class TMDBSession(ScraperSession):
 class TMDBPlugin(ScraperPlugin):
     plugin_id = "tmdb"
     display_name = "TMDB"
-    version = "1.0.0"
+    version = "20260930"
     capabilities = frozenset({
         Capability.MOVIES, Capability.SERIES, Capability.SEASONS, Capability.EPISODES,
         Capability.ARTWORK, Capability.EXTERNAL_IDS, Capability.RATINGS,

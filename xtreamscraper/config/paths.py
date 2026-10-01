@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
-DATA_DIR_ENV = "XTREAM_STRM_DATA_DIR"
+DATA_DIR_ENV = "XTREAMSCRAPER_DATA_DIR"
 
 
 def app_root() -> str:
@@ -29,7 +29,7 @@ class AppPaths:
 
     @property
     def db_path(self) -> str:
-        return os.path.join(self.data_dir, "xtream-strm.db")
+        return os.path.join(self.data_dir, "xtreamscraper.db")
 
     @property
     def log_dir(self) -> str:

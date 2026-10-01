@@ -1,8 +1,8 @@
-"""Xtream-to-STRM entry point.
+"""XtreamScraper entry point.
 
     python app.py                 # http://localhost:6060
     python app.py --port 7070     # override the configured port for this run
-    python app.py --data-dir D:\\XtreamSTRM\\data
+    python app.py --data-dir D:\\XtreamScraper\\data
 """
 
 from __future__ import annotations
@@ -20,11 +20,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer is required.", file=sys.stderr)
         return 1
 
-    from xtream_strm import APP_NAME, __version__
-    from xtream_strm.config.paths import resolve_paths
-    from xtream_strm.context import build_context
-    from xtream_strm.utils.logging_setup import set_level, setup_logging
-    from xtream_strm.web.server import create_app
+    from xtreamscraper import APP_NAME, __version__
+    from xtreamscraper.config.paths import resolve_paths
+    from xtreamscraper.context import build_context
+    from xtreamscraper.utils.logging_setup import set_level, setup_logging
+    from xtreamscraper.web.server import create_app
 
     parser = argparse.ArgumentParser(description=f"{APP_NAME} – Xtream VOD/Series to STRM library manager")
     parser.add_argument("--data-dir", help="Folder for the database and logs (default: ./data next to app.py)")
@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     paths = resolve_paths(args.data_dir)
     paths.ensure()
     log_path = setup_logging(paths.log_dir)
-    log = logging.getLogger("xtream_strm")
+    log = logging.getLogger("xtreamscraper")
     log.info("%s %s starting (Python %s)", APP_NAME, __version__, sys.version.split()[0])
     log.info("Data folder: %s", paths.data_dir)
 

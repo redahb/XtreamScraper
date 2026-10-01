@@ -29,7 +29,7 @@ def create_app(ctx: AppContext) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
     app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
-    app.extensions["xtream_ctx"] = ctx
+    app.extensions["xtreamscraper_ctx"] = ctx
 
     @app.before_request
     def guard():

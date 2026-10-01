@@ -12,7 +12,7 @@ from typing import Optional
 from .redact import redact
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s"
-LOG_FILE_NAME = "xtream-strm.log"
+LOG_FILE_NAME = "xtreamscraper.log"
 _MAX_BYTES = 5 * 1024 * 1024
 _BACKUP_COUNT = 5
 

@@ -60,7 +60,7 @@ class NfoSeed:
 def update_nfo(path: str, kind: NfoKind, mutate: Mutator, seed: Optional[NfoSeed] = None) -> NfoUpdateResult:
     """Load (or create) the NFO at ``path``, apply ``mutate`` and save if anything changed.
 
-    Raises :class:`~xtream_strm.nfo.document.NfoParseError` for an existing file that is
+    Raises :class:`~xtreamscraper.nfo.document.NfoParseError` for an existing file that is
     not valid NFO XML: such a file is never overwritten.
     """
     with _lock_for(path):

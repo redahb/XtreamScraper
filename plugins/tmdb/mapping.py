@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Optional
 
-from xtream_strm.metadata.models import (
+from xtreamscraper.metadata.models import (
     Artwork,
     ArtworkType,
     Collection,

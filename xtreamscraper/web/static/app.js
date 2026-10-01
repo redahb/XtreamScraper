@@ -75,7 +75,7 @@ async function refreshStatus() {
     return;
   }
   state.providers = data.providers;
-  $("#version").textContent = "v" + data.version;
+  $("#version").textContent = data.version;
   const banner = $("#ffprobe-banner");
   if (data.ffprobe.found) {
     banner.classList.add("hidden");
@@ -430,7 +430,7 @@ async function loadScrapers() {
     <td>${p.priority}
       <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="up" ${i === 0 ? "disabled" : ""} title="Move up">▲</button>
       <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="down" ${i === n - 1 ? "disabled" : ""} title="Move down">▼</button></td>
-    <td><strong>${esc(p.name)}</strong> ${p.version ? `<span class="muted small">v${esc(p.version)}</span>` : ""}</td>
+    <td><strong>${esc(p.name)}</strong> ${p.version ? `<span class="muted small">${esc(p.version)}</span>` : ""}</td>
     <td class="small">${p.media_types.map(esc).join(", ") || "–"}</td>
     <td><label class="small"><span><input type="checkbox" data-action="scraper-enabled" data-id="${esc(p.plugin_id)}" ${p.enabled ? "checked" : ""}> ${p.enabled ? "enabled" : "disabled"}</span></label></td>
     <td><label class="small"><span><input type="checkbox" data-action="scraper-overwrite" data-id="${esc(p.plugin_id)}" ${p.overwrite ? "checked" : ""}> ${p.overwrite ? "on" : "off"}</span></label></td>
@@ -596,7 +596,7 @@ async function loadArtworkHistory() {
 
 async function loadAbout() {
   const data = await api("GET", "/about");
-  $("#about-version").textContent = "v" + data.version;
+  $("#about-version").textContent = data.version;
   $("#about-attributions").innerHTML = data.attributions.length ? data.attributions.map((a) =>
     `<p><strong>${esc(a.name)}</strong>: ${esc(a.text)} ${a.url ? `<a href="${esc(a.url)}" rel="noopener noreferrer" target="_blank">${esc(a.url)}</a>` : ""}</p>`).join("")
     : '<p class="muted">No metadata scrapers installed.</p>';

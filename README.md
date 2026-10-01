@@ -1,6 +1,6 @@
-# Xtream-to-STRM
+# XtreamScraper
 
-Xtream-to-STRM is a small standalone application that turns the **VOD** (Movies and Series) from one or more Xtream-compatible IPTV providers into a local library of `.strm` files. It can also scrape information and write it to `.nfo` files, compatible with **Jellyfin**, **Kodi**, **Emby**, or **Plex**.
+XtreamScraper is a small standalone application that turns the **VOD** (Movies and Series) from one or more Xtream-compatible IPTV providers into a local library of `.strm` files. It can also scrape information and write it to `.nfo` files, compatible with **Jellyfin**, **Kodi**, **Emby**, or **Plex**.
 
 **Live TV** is not supported, use [Dispatcharr](https://github.com/dispatcharr/dispatcharr) for that.
 
@@ -14,7 +14,7 @@ Xtream-to-STRM is a small standalone application that turns the **VOD** (Movies 
 - **FFprobe** if you want to use the media probing functionality
 
 > [!IMPORTANT]
-> Xtream-to-STRM is intended for (and developed on) **Windows**, although it might also run on Linux and macOS.
+> XtreamScraper is intended for (and developed on) **Windows**, although it might also run on Linux and macOS.
 
 ## Installation
 

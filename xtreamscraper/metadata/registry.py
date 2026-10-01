@@ -3,7 +3,7 @@
 The application ships no plugins of its own: every scraper lives in ``<app>/plugins/``,
 either as a single ``*.py`` file or as a self-contained package folder
 (``plugins/<id>/__init__.py`` plus its own modules, tests and README). Package folders are
-imported as ``xtream_strm_plugins.<folder>``. The registry only knows which plugins exist;
+imported as ``xtreamscraper_plugins.<folder>``. The registry only knows which plugins exist;
 their enabled/priority/overwrite state and configuration live in the database
 (:mod:`.manager`). A plugin that fails to load is logged and skipped.
 """
@@ -23,12 +23,12 @@ from .plugin import ScraperPlugin
 
 log = logging.getLogger(__name__)
 
-PACKAGE = "xtream_strm_plugins"
+PACKAGE = "xtreamscraper_plugins"
 """Parent package under which plugin folders are imported."""
 
 
 def add_plugin_path(directory: str) -> None:
-    """Make the plugin folders in ``directory`` importable as ``xtream_strm_plugins.<folder>``."""
+    """Make the plugin folders in ``directory`` importable as ``xtreamscraper_plugins.<folder>``."""
     namespace = sys.modules.get(PACKAGE)
     if namespace is None:
         namespace = types.ModuleType(PACKAGE)
@@ -87,7 +87,7 @@ class PluginRegistry:
         """Import a single-file plugin (``plugins/<name>.py``)."""
         filename = os.path.basename(path)
         try:
-            spec = importlib.util.spec_from_file_location(f"xtream_strm_plugin_{filename[:-3]}", path)
+            spec = importlib.util.spec_from_file_location(f"xtreamscraper_plugin_{filename[:-3]}", path)
             if spec is None or spec.loader is None:
                 return 0
             module = importlib.util.module_from_spec(spec)
@@ -98,7 +98,7 @@ class PluginRegistry:
         return self._register_from(module)
 
     def load_package(self, path: str) -> int:
-        """Import a plugin folder (``plugins/<name>/__init__.py``) as ``xtream_strm_plugins.<name>``."""
+        """Import a plugin folder (``plugins/<name>/__init__.py``) as ``xtreamscraper_plugins.<name>``."""
         path = os.path.abspath(path)
         name = os.path.basename(path)
         if not name.isidentifier():

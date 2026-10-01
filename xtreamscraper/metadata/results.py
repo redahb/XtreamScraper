@@ -94,7 +94,7 @@ class MatchOutcome:
 
     @classmethod
     def from_decision(cls, decision: "MatchDecision", method: MatchMethod, max_candidates: int = 5) -> "MatchOutcome":
-        """Translate a shared-matcher decision (see ``xtream_strm.core.matching``)."""
+        """Translate a shared-matcher decision (see ``xtreamscraper.core.matching``)."""
         candidates = [Candidate(str(s.candidate.remote_id), s.matched_title, s.candidate.year, s.score)
                       for s in decision.ranked[:max_candidates]]
         if decision.matched and decision.best is not None:
