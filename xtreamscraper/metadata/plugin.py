@@ -6,7 +6,9 @@ A plugin only:
 2. declares its configuration (a schema; the WebUI renders the plugin's own page from it),
 3. searches/matches remote items,
 4. retrieves metadata,
-5. returns normalized :class:`~.models.MetadataResult` objects.
+5. returns normalized :class:`~.models.MetadataResult` objects,
+6. declares which IDs a user may enter by hand (:meth:`ScraperPlugin.manual_id_fields`), checks
+   their syntax and resolves alternate IDs to its own remote IDs.
 
 It never writes NFO XML, never decides merge/overwrite behaviour and never stores its
 own enabled/priority/overwrite state: the core owns all of that.
@@ -23,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 from ..core.matching.models import ScoringProfile
-from .results import FetchOutcome, MatchOutcome, MatchQuery, MatchStatus
+from .results import FetchOutcome, MatchOutcome, MatchQuery, MatchStatus, ResolveOutcome
 
 
 class Capability(str, enum.Enum):
@@ -41,6 +43,27 @@ MEDIA_CAPABILITIES = (Capability.MOVIES, Capability.SERIES, Capability.SEASONS, 
 
 class ConfigError(ValueError):
     """Invalid plugin configuration; the message is shown to the user."""
+
+
+class ManualIdError(ValueError):
+    """A manually entered ID is malformed; the message is shown to the user."""
+
+
+@dataclass
+class ManualIdField:
+    """One kind of ID a user may enter by hand for a plugin (see
+    :meth:`ScraperPlugin.manual_id_fields`). The plugin's own :attr:`~ScraperPlugin.id_namespace`
+    is its native ID; any other namespace is an alternate ID the plugin resolves itself."""
+
+    namespace: str
+    label: str
+    help: str = ""
+    placeholder: str = ""
+    pattern_hint: str = ""
+
+    def public_dict(self) -> dict[str, Any]:
+        return {"namespace": self.namespace, "label": self.label, "help": self.help,
+                "placeholder": self.placeholder, "pattern_hint": self.pattern_hint}
 
 
 class FieldType(str, enum.Enum):
@@ -161,6 +184,16 @@ class ScraperSession(abc.ABC):
     def get_episode(self, series_remote_id: str, season_number: int, episode_number: int) -> FetchOutcome:
         return FetchOutcome.unsupported()
 
+    def resolve_manual_id(self, media_type: str, namespace: str, value: str) -> ResolveOutcome:
+        """The native remote ID of the ``"movie"`` or ``"series"`` an alternate manual ID points to.
+
+        Called only for alternate namespaces the plugin declared in
+        :meth:`ScraperPlugin.manual_id_fields`, with a value from
+        :meth:`ScraperPlugin.normalize_manual_id`. It must use only that ID: an unknown ID is
+        ``not_found``, never a fallback to a title search.
+        """
+        return ResolveOutcome.unsupported()
+
     def fetch_artwork(self, download_ref: str) -> Optional[ArtworkPayload]:
         """Bytes for an artwork candidate's ``download_ref``, or ``None`` when unavailable.
 
@@ -198,6 +231,23 @@ class ScraperPlugin(abc.ABC):
 
     def config_schema(self) -> list[ConfigField]:
         return []
+
+    def manual_id_fields(self, media_type: str) -> list[ManualIdField]:
+        """The IDs a user may enter by hand to match a root ``"movie"`` or ``"series"``.
+
+        Nothing by default. The native namespace (:attr:`id_namespace`) is fetched directly;
+        every other namespace listed here is resolved by
+        :meth:`ScraperSession.resolve_manual_id`.
+        """
+        return []
+
+    def normalize_manual_id(self, namespace: str, value: str) -> str:
+        """The clean form of a manually entered ID, or :class:`ManualIdError` when malformed.
+
+        Only called for namespaces listed by :meth:`manual_id_fields`. The core knows nothing
+        about any ID syntax.
+        """
+        raise ManualIdError("This ID type is not supported")
 
     def validate_config(self, values: dict[str, Any]) -> dict[str, Any]:
         """Return the cleaned configuration or raise :class:`ConfigError`."""

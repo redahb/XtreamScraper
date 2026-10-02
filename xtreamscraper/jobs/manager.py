@@ -7,10 +7,12 @@ different providers may be processed concurrently.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 from collections import OrderedDict
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Callable, Iterator, Optional
 
 from ..artwork.reconcile import ArtworkReconciler, effective_root
 from ..config.paths import AppPaths
@@ -99,6 +101,21 @@ class JobManager:
 
     def is_busy(self, provider_id: int) -> bool:
         return self._lock_for(provider_id).locked()
+
+    @contextmanager
+    def provider_locked(self, provider_id: int, activity: str) -> Iterator[None]:
+        """Hold the provider's job lock for a short operation outside a job (``BusyError`` if taken)."""
+        lock = self._lock_for(provider_id)
+        if not lock.acquire(blocking=False):
+            raise BusyError("A job is running for this provider; try again when it has finished")
+        try:
+            with self._lock:
+                self._provider_activity[provider_id] = activity
+            yield
+        finally:
+            with self._lock:
+                self._provider_activity.pop(provider_id, None)
+            lock.release()
 
     def wait_all(self, timeout: Optional[float] = None) -> None:
         for thread in list(self._threads):
@@ -282,6 +299,19 @@ class JobManager:
         self._spawn(self._run_scrape, progress, [p.id for p in targets], request)
         return progress
 
+    def start_item_scrape(self, provider_id: int, item_kind: str, category_id: str, item_id: str,
+                          title: str) -> JobProgress:
+        """Scrape one movie or series (with its seasons and episodes) through the normal engine."""
+        if self.scrapers is None:
+            raise RuntimeError("Metadata scraping is not available")
+        target = self._targets(provider_id)[0]
+        request = ScrapeRequest(provider_id=provider_id, kinds=(item_kind,), force=True,
+                                item=(item_kind, category_id, item_id))
+        progress = JobProgress("metadata", f"Scrape metadata for '{title}': {target.name}")
+        self._register(progress)
+        self._spawn(self._run_scrape, progress, [target.id], request)
+        return progress
+
     def _run_scrape(self, progress: JobProgress, provider_ids: list[int], request: ScrapeRequest) -> None:
         progress.start()
         settings = self.settings_store.load()
@@ -313,8 +343,7 @@ class JobManager:
                     progress.history_ids.append(row)
                     root = effective_root(provider.target_folder, settings.default_target_folder)
                     engine = ScrapeEngine(self.db, settings, self.scrapers, progress, library_root=root)
-                    status, stats = engine.run(
-                        ScrapeRequest(provider_id=pid, kinds=request.kinds, force=request.force), provider.name)
+                    status, stats = engine.run(dataclasses.replace(request, provider_id=pid), provider.name)
                     finished = now_iso()
                     self.metadata_history.set_plugins(row, stats.plugins_used)
                     self.metadata_history.finish(

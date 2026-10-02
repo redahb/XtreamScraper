@@ -23,8 +23,9 @@ from ..library.models import EPISODE, MOVIE, LibraryItem
 from ..nfo.document import NfoError
 from ..mediainfo.models import MEDIA_SCHEMA_VERSION, MediaInfo
 from ..nfo.mediainfo_writer import apply_media_info
-from ..nfo.service import NfoSeed, update_nfo
+from ..nfo.service import NfoOwner, NfoSeed, update_nfo
 from ..storage.db import Database
+from ..storage.nfo_files import NfoFileRepository
 from ..storage.probe_state import (
     STATUS_FAILED,
     STATUS_INVALID_STRM,
@@ -111,6 +112,7 @@ class ProbeEngine:
         self.progress = progress
         self.runner = runner
         self.state = ProbeStateRepository(db)
+        self.nfo_files = NfoFileRepository(db)
         self.index = LibraryIndex(db)
         self.options = ProbeOptions(
             timeout_seconds=settings.probe_timeout_seconds,
@@ -253,6 +255,7 @@ class ProbeEngine:
                     episode=item.episode,
                     show_title=item.series_title,
                 ),
+                NfoOwner(self.nfo_files, (item.provider_id, item.kind, item.category_id, item.item_id)),
             )
         except (NfoError, OSError) as exc:
             with self._stats_lock:

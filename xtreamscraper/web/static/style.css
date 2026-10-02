@@ -48,6 +48,9 @@ tbody tr:nth-child(even) { background: var(--row); }
 .s-success, .s-ok { color: var(--ok); }
 .s-partial, .s-running, .s-queued, .s-warn { color: var(--warn); }
 .s-failed, .s-cancelled, .s-interrupted, .s-err { color: var(--err); }
+.s-matched { color: var(--ok); }
+.s-ambiguous, .s-api_error { color: var(--warn); }
+.s-unmatched, .s-invalid_binding, .s-not_found { color: var(--err); }
 .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; border: 1px solid; }
 .banner.warn { color: var(--warn); background: var(--panel); }
 .job { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
@@ -74,3 +77,8 @@ label > .badge { align-self: flex-start; }
 .options input[type="radio"] { width: auto; margin: 0; flex: none; }
 #scraper-config-status table { width: auto; margin: 8px 0; }
 #scraper-config-status td { padding-right: 24px; }
+.um-plugin { margin: 2px 0; }
+.um-binding { border-top: 1px solid var(--border); padding: 8px 0; }
+.um-binding table { width: auto; margin: 6px 0; }
+.um-preview { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.um-warn { border-left: 3px solid var(--warn); padding: 6px 10px; margin: 8px 0; }

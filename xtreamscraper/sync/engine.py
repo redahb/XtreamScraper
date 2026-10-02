@@ -1,9 +1,16 @@
 """Incremental Xtream -> STRM synchronization for one provider.
 
 For every selected category the engine fetches the provider's current catalog,
-compares it with the stored synchronization state (keyed by stable Xtream IDs), writes
-only what is new or changed, and records items the provider no longer returns as
-``missing``. Files are never deleted.
+compares it with the stored synchronization state (keyed by stable Xtream IDs) and writes
+only what is new or changed.
+
+Items a successful provider answer no longer lists become ``missing``: their ``.strm`` is
+quarantined (renamed to ``.strm.bak``), everything else stays, and they are restored when
+they come back. Absence is judged per content type only after every selected category was
+processed, never from a failed request, never from a category the provider no longer lists,
+and an empty answer for a category that had items only counts once a second consecutive
+sync confirms it. Permanent removal of what the application owns is opt-in
+(``missing_purge_days``) and needs such a confirmation too; see :mod:`.lifecycle`.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ from ..jobs.progress import JobCancelled, JobProgress
 from ..storage.categories import MOVIE, SERIES, CategoryRecord, CategoryRepository
 from ..storage.db import Database
 from ..storage.providers import Provider
+from ..storage.nfo_files import NfoFileRepository
 from ..storage.sync_state import (
     ACTIVE,
     EpisodeRecord,
@@ -55,6 +63,8 @@ from ..utils.timeutil import now_iso, older_than
 from ..xtream.client import ClientOptions, XtreamClient, XtreamError
 from ..xtream.models import Episode, SeriesEntry, VodStream
 from ..xtream.urls import build_episode_url, build_movie_url, stream_id_from_url
+from ..nfo.paths import episode_nfo_path
+from .lifecycle import MissingItemLifecycle
 from .stats import SyncStats
 
 log = logging.getLogger(__name__)
@@ -141,6 +151,9 @@ class SyncEngine:
         self._owns_client = client is None
         self.stats = SyncStats()
         self.now = now_iso()
+        self.nfo_files = NfoFileRepository(db)
+        self.lifecycle = MissingItemLifecycle(db, settings, self.layout.provider_dir,
+                                              os.path.abspath(self.target_root) if self.target_root else "", self.stats)
         # Changing the URL or credentials changes every stream URL.
         self.credentials_fp = fingerprint(provider.base_url, provider.username, provider.password)
 
@@ -207,12 +220,20 @@ class SyncEngine:
 
         if do_movies:
             self._refresh_categories(MOVIE)
+            confirmed: list[tuple[CategoryRecord, set[str]]] = []
             for category, folder in self._selected_with_folders(MOVIE):
-                self._sync_movie_category(category, folder)
+                seen = self._sync_movie_category(category, folder)
+                if seen is not None:
+                    confirmed.append((category, seen))
+            self._missing_movies(confirmed)
         if do_series:
             self._refresh_categories(SERIES)
+            confirmed = []
             for category, folder in self._selected_with_folders(SERIES):
-                self._sync_series_category(category, folder, request.full_refresh)
+                seen = self._sync_series_category(category, folder, request.full_refresh)
+                if seen is not None:
+                    confirmed.append((category, seen))
+            self._missing_series(confirmed)
 
     # -- categories -----------------------------------------------------------------------------
     def _refresh_categories(self, content_type: str) -> None:
@@ -253,6 +274,30 @@ class SyncEngine:
             result.append((category, folder))
         return result
 
+    def _absence_confirmed(self, category: CategoryRecord, label: str, listed: int, known: int) -> bool:
+        """May items this category's successful answer does not list be treated as missing?
+
+        Not when the provider no longer lists the category itself (renumbered or dropped
+        categories must not empty the library), and not for a first empty answer for a
+        category that had items: only a second consecutive empty answer confirms it.
+        """
+        if not category.present:
+            self.stats.categories_unconfirmed += 1
+            self.stats.warn(f"{label}: the provider no longer lists this category; its items are kept as they are")
+            return False
+        if listed == 0 and known > 0:
+            empty = category.empty_syncs + 1
+            self.categories.set_empty_syncs(self.provider.id, category.content_type, category.category_id, empty)
+            if empty < 2:
+                self.stats.categories_unconfirmed += 1
+                self.stats.warn(f"{label}: the provider returned no items; nothing is marked missing unless the "
+                                "next sync confirms the category is empty")
+                return False
+            return True
+        if listed > 0 and category.empty_syncs:
+            self.categories.set_empty_syncs(self.provider.id, category.content_type, category.category_id, 0)
+        return True
+
     def _category_failed(self, label: str, exc: Exception) -> None:
         self.stats.categories_failed += 1
         message = f"{label}: {exc}"
@@ -270,7 +315,8 @@ class SyncEngine:
             log.exception("Item failed – %s", redact(message))
 
     # -- movies ------------------------------------------------------------------------------------
-    def _sync_movie_category(self, category: CategoryRecord, folder: str) -> None:
+    def _sync_movie_category(self, category: CategoryRecord, folder: str) -> Optional[set[str]]:
+        """Sync one category. Returns the stream IDs it listed when that answer may confirm absence."""
         label = f"Movies / {category.name}"
         self.stats.categories.append(label)
         self.progress.update(phase="Movies", category=category.name)
@@ -280,7 +326,7 @@ class SyncEngine:
             streams = self.client.get_vod_streams(category.category_id, warnings)
         except XtreamError as exc:
             self._category_failed(label, exc)
-            return
+            return None
         for warning in warnings:
             self.stats.warn(f"{label}: {warning}")
             self.progress.warning()
@@ -312,8 +358,31 @@ class SyncEngine:
         finally:
             if pending:
                 self.state.upsert_movies(pending)
-        self.stats.movies_missing += self.state.mark_missing_movies(self.provider.id, category.category_id, seen)
         self.stats.categories_processed += 1
+        return seen if self._absence_confirmed(category, label, len(unique), len(records)) else None
+
+    def _missing_movies(self, confirmed: list[tuple[CategoryRecord, set[str]]]) -> None:
+        """Quarantine newly missing movies; purge long-missing ones (absence confirmed again)."""
+        for category, seen in confirmed:
+            for record in self.state.movies_in_category(self.provider.id, category.category_id).values():
+                if record.stream_id in seen:
+                    continue
+                self.progress.check_cancelled()
+                label = f"Movies / {category.name} / {record.title}"
+                key = (self.provider.id, category.category_id, record.stream_id)
+                if record.status == ACTIVE:
+                    self.stats.movies_missing += 1
+                if record.status == ACTIVE or record.missing_since is None:
+                    self.state.mark_movie_missing(*key, self.now)  # starts the clock once
+                    record.missing_since = record.missing_since or self.now
+                if record.quarantined_at is None:
+                    done, path = self.lifecycle.quarantine(label, record.strm_path)
+                    if done:
+                        self.state.set_movie_quarantine(*key, self.now, path)
+                        self.stats.movies_quarantined += 1 if path else 0
+                    continue
+                if self.lifecycle.purge_due(record.missing_since):
+                    self.lifecycle.purge_movie(record)
 
     def _movie_folder_foreign(self, category_dir: str, name: str, stream_id: str) -> bool:
         """True when ``name`` already holds another stream's STRM (e.g. from before a DB reset)."""
@@ -353,6 +422,9 @@ class SyncEngine:
         url_hash = url_fingerprint(url)
         source_fp = fingerprint(title, year, stream.extension, url_hash, strm_path)
 
+        if record is not None and record.status != ACTIVE:
+            self.lifecycle.restore(f"Movie '{title}'", record.strm_path, record.quarantine_path)
+            self.stats.movies_restored += 1
         relocated = False
         if record is not None and not _same_path(record.strm_path, strm_path):
             relocated = self._relocate_movie(record, folder_path, folder_name)
@@ -403,6 +475,8 @@ class SyncEngine:
                 if atomic.is_dir(current) and not atomic.exists(folder_path):
                     moved = atomic.move(current, folder_path)
                     current = folder_path
+                    if moved:
+                        self.nfo_files.move_folder(self.provider.id, record.folder_path, folder_path)
                 else:
                     return False
             if record.folder_name != folder_name:
@@ -416,7 +490,8 @@ class SyncEngine:
         return moved
 
     # -- series ------------------------------------------------------------------------------------
-    def _sync_series_category(self, category: CategoryRecord, folder: str, full_refresh: bool) -> None:
+    def _sync_series_category(self, category: CategoryRecord, folder: str, full_refresh: bool) -> Optional[set[str]]:
+        """Sync one category. Returns the series IDs it listed when that answer may confirm absence."""
         label = f"Series / {category.name}"
         self.stats.categories.append(label)
         self.progress.update(phase="Series", category=category.name)
@@ -426,7 +501,7 @@ class SyncEngine:
             entries = self.client.get_series(category.category_id, warnings)
         except XtreamError as exc:
             self._category_failed(label, exc)
-            return
+            return None
         for warning in warnings:
             self.stats.warn(f"{label}: {warning}")
             self.progress.warning()
@@ -452,10 +527,45 @@ class SyncEngine:
                 self.stats.series_failed += 1
                 self._item_failed(f"{label} / {entry.name or entry.series_id}", exc)
             self.progress.advance()
-        gone_series, gone_episodes = self.state.mark_missing_series(self.provider.id, category.category_id, seen)
-        self.stats.series_missing += gone_series
-        self.stats.episodes_missing += gone_episodes
         self.stats.categories_processed += 1
+        return seen if self._absence_confirmed(category, label, len(unique), len(records)) else None
+
+    def _missing_series(self, confirmed: list[tuple[CategoryRecord, set[str]]]) -> None:
+        """A missing series quarantines all its episodes; purging removes the whole series."""
+        for category, seen in confirmed:
+            for record in self.state.series_in_category(self.provider.id, category.category_id).values():
+                if record.series_id in seen:
+                    continue
+                self.progress.check_cancelled()
+                if record.status == ACTIVE:
+                    self.stats.series_missing += 1
+                if record.status == ACTIVE or record.missing_since is None:
+                    self.state.mark_series_missing(self.provider.id, category.category_id, record.series_id, self.now)
+                    record.missing_since = record.missing_since or self.now
+                episodes = list(self.state.episodes_of_series(self.provider.id, category.category_id,
+                                                              record.series_id).values())
+                quarantined = self._quarantine_episodes(f"Series / {category.name} / {record.title}", episodes)
+                if quarantined and self.lifecycle.purge_due(record.missing_since):
+                    self.lifecycle.purge_series(record, episodes)
+
+    def _quarantine_episodes(self, label: str, episodes: Iterable[EpisodeRecord]) -> bool:
+        """Mark the episodes missing and quarantine their ``.strm``. True when all are quarantined
+        and were so before this sync (only then may a purge follow)."""
+        settled = True
+        for episode in episodes:
+            key = (episode.provider_id, episode.category_id, episode.series_id, episode.episode_id)
+            if episode.status == ACTIVE:
+                self.stats.episodes_missing += 1
+            if episode.status == ACTIVE or episode.missing_since is None:
+                self.state.mark_episode_missing(*key, self.now)
+                episode.missing_since = episode.missing_since or self.now
+            if episode.quarantined_at is None:
+                settled = False
+                done, path = self.lifecycle.quarantine(f"{label} episode {episode.episode_id}", episode.strm_path)
+                if done:
+                    self.state.set_episode_quarantine(*key, self.now, path)
+                    self.stats.episodes_quarantined += 1 if path else 0
+        return settled
 
     def _can_skip_series(
         self,
@@ -506,6 +616,9 @@ class SyncEngine:
         if record is not None and not _same_path(record.folder_path, series_path):
             try:
                 if atomic.is_dir(record.folder_path) and not atomic.exists(series_path) and atomic.move(record.folder_path, series_path):
+                    self.nfo_files.move_folder(self.provider.id, record.folder_path, series_path)
+                    self.state.move_episode_paths(self.provider.id, category.category_id, sid, record.folder_path,
+                                                  series_path)
                     self.stats.items_relocated += 1
                     log.info("Relocated series %s -> %s", record.folder_path, series_path)
             except OSError as exc:
@@ -585,10 +698,24 @@ class SyncEngine:
         finally:
             if pending:
                 self.state.upsert_episodes(pending)
-        missing = self.state.mark_missing_episodes(self.provider.id, category.category_id, sid, seen)
-        self.stats.episodes_missing += missing
+        gone = [e for eid, e in episode_records.items() if eid not in seen]
+        newly_missing = [e for e in gone if e.status == ACTIVE]
+        if gone and not seen:
+            # An answer without a single episode for a show that had some is more likely a
+            # provider glitch than a show without episodes: keep its episodes as they are.
+            gone = []
+            if newly_missing:
+                self.stats.warn(f"{display}: the provider listed no episodes; existing episodes are kept as they are")
+            newly_missing = []
         self.stats.series_processed += 1
-        save_series(self.now, len(pending), changed or missing > 0)
+        save_series(self.now, len(pending), changed or bool(newly_missing))
+        if gone:
+            due = [e for e in gone if e.status != ACTIVE and e.quarantined_at is not None
+                   and self.lifecycle.purge_due(e.missing_since)]
+            self._quarantine_episodes(f"Series / {category.name} / {display}", gone)
+            current = self.state.series_in_category(self.provider.id, category.category_id).get(sid)
+            if due and current is not None:
+                self.lifecycle.purge_episodes(current, due)
 
     def _episode_file_foreign(self, season_dir: str, name: str, episode_id: str) -> bool:
         url = read_strm_url(os.path.join(season_dir, name + ".strm"))
@@ -628,6 +755,9 @@ class SyncEngine:
         url_hash = url_fingerprint(url)
         source_fp = fingerprint(episode.season, episode.episode_num, episode.title, episode.extension, url_hash, strm_path)
 
+        if record is not None and record.status != ACTIVE:
+            self.lifecycle.restore(f"{display} episode {eid}", record.strm_path, record.quarantine_path)
+            self.stats.episodes_restored += 1
         relocated = False
         if record is not None and not _same_path(record.strm_path, strm_path):
             old_dir = os.path.dirname(record.strm_path)
@@ -636,6 +766,7 @@ class SyncEngine:
                     atomic.ensure_dir(season_dir)
                     relocated = rename_sidecars(old_dir, record.file_name, file_name, target_dir=season_dir) > 0
                     if relocated:
+                        self.nfo_files.move(episode_nfo_path(record.strm_path), episode_nfo_path(strm_path))
                         self.stats.items_relocated += 1
             except OSError as exc:
                 self.stats.warn(f"Could not move '{record.strm_path}': {exc}")

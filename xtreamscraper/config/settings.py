@@ -34,6 +34,10 @@ class Settings:
     # Series incremental sync: re-fetch series info at least this often even when the
     # provider's last_modified value says nothing changed (0 = always re-fetch).
     series_full_refresh_days: int = 7
+    # Missing items: their .strm is quarantined (.strm.bak) at once; after this many days of
+    # being continuously missing, a sync that confirms the absence again permanently removes
+    # the files the application owns (0 = never).
+    missing_purge_days: int = 0
     # Probing
     ffprobe_path: str = ""
     probe_timeout_seconds: int = 60
@@ -79,6 +83,7 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "http_retries": (0, 10),
     "request_delay_ms": (0, 60000),
     "series_full_refresh_days": (0, 3650),
+    "missing_purge_days": (0, 3650),
     "probe_timeout_seconds": (5, 3600),
     "probe_analyze_duration_ms": (500, 120000),
     "probe_size_kb": (32, 200000),

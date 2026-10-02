@@ -22,6 +22,17 @@ INVALID_BINDING = "invalid_binding"
 API_ERROR = "api_error"
 NOT_FOUND = "not_found"  # parent matched, but the remote season/episode does not exist
 
+#: Root (movie/series) binding states a user can fix by entering an ID. ``api_error`` is not one
+#: of them: the source failed for a while and nothing is known about the match.
+UNRESOLVED = (UNMATCHED, AMBIGUOUS, INVALID_BINDING, NOT_FOUND)
+#: Filters of the root-item overview. ``matched``: at least one plugin in scope has a match;
+#: ``unmatched``: none has (ambiguous, not found and errors included); the others: at least one
+#: plugin in scope is in that state; ``manual``: at least one match was set by hand.
+OVERVIEW_FILTERS = (UNMATCHED, AMBIGUOUS, INVALID_BINDING, NOT_FOUND, MATCHED, "manual")
+#: SQL: binding ``b`` holds a match (an API error keeps the stored match).
+HAS_MATCH = "(b.status = 'matched' OR (b.status = 'api_error' AND COALESCE(b.remote_id, '') != ''))"
+ROOT_KINDS = ("movie", "series")
+
 
 @dataclass
 class PluginState:
@@ -53,6 +64,13 @@ class Binding:
     message: Optional[str] = None
     candidates: list[dict] = field(default_factory=list)
     config_fingerprint: Optional[str] = None
+    #: IDs the user entered by hand and confirmed for this match (``{namespace: value}``): the
+    #: native remote ID plus the alternate ID it was found with. Empty for automatic matches.
+    manual_ids: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def manual(self) -> bool:
+        return bool(self.manual_ids)
 
     @property
     def key(self) -> tuple:
@@ -178,11 +196,17 @@ class ScraperStateRepository:
             data["candidates"] = json.loads(data["candidates"] or "[]")
         except ValueError:
             data["candidates"] = []
+        try:
+            manual = json.loads(data["manual_ids"] or "{}")
+        except ValueError:
+            manual = {}
+        data["manual_ids"] = {str(k): str(v) for k, v in manual.items() if k and v} if isinstance(manual, dict) else {}
         return Binding(**data)
 
     def save_binding(self, binding: Binding) -> None:
         data = asdict(binding)
         data["candidates"] = json.dumps(data["candidates"][:10])
+        data["manual_ids"] = json.dumps(data["manual_ids"] or {}, sort_keys=True)
         columns = ", ".join(data)
         placeholders = ", ".join("?" for _ in data)
         updates = ", ".join(f"{c} = excluded.{c}" for c in data if c not in _BINDING_KEYS)
@@ -192,6 +216,91 @@ class ScraperStateRepository:
                 f"ON CONFLICT({', '.join(_BINDING_KEYS)}) DO UPDATE SET {updates}",
                 tuple(data.values()),
             )
+
+    def delete_binding(self, plugin_id: str, item_kind: str, provider_id: int, category_id: str, item_id: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM scraper_bindings WHERE plugin_id = ? AND item_kind = ? AND provider_id = ? "
+                         "AND category_id = ? AND item_id = ?", (plugin_id, item_kind, provider_id, category_id, item_id))
+
+    def item_bindings(self, item_kind: str, provider_id: int, category_id: str, item_id: str) -> list[Binding]:
+        """Every plugin's binding for one item."""
+        rows = self.db.query(
+            "SELECT * FROM scraper_bindings WHERE item_kind = ? AND provider_id = ? AND category_id = ? AND item_id = ? "
+            "ORDER BY plugin_id", (item_kind, provider_id, category_id, item_id))
+        return [self._binding(r) for r in rows]
+
+    def bindings_for_items(self, keys: list[tuple]) -> list[Binding]:
+        """The bindings of every plugin for the given ``(item_kind, provider_id, category_id, item_id)`` keys."""
+        result: list[Binding] = []
+        for start in range(0, len(keys), 200):
+            chunk = keys[start:start + 200]
+            values = ", ".join("(?, ?, ?, ?)" for _ in chunk)
+            rows = self.db.query(
+                f"SELECT * FROM scraper_bindings WHERE (item_kind, provider_id, category_id, item_id) IN (VALUES {values})",
+                tuple(v for key in chunk for v in key))
+            result.extend(self._binding(r) for r in rows)
+        return result
+
+    def root_overview(self, plugin_ids: list[str], status: str = UNMATCHED, provider_id: Optional[int] = None,
+                      item_kind: Optional[str] = None, title: str = "", limit: int = 50,
+                      offset: int = 0) -> tuple[int, list[dict]]:
+        """Active root items (movies and series, never seasons or episodes) in the requested state
+        (see :data:`OVERVIEW_FILTERS`), judged on the bindings of ``plugin_ids`` only. Items no
+        plugin in scope has tried are never listed. Returns the total and one page of item rows."""
+        if not plugin_ids:
+            return 0, []
+        negate = False
+        if status == "manual":
+            condition, cond_params = "b.manual_ids NOT IN ('', '{}')", ()
+        elif status == UNMATCHED:  # tried, but no plugin in scope holds a match
+            condition, cond_params, negate = HAS_MATCH, (), True
+        elif status == MATCHED:
+            condition, cond_params = HAS_MATCH, ()
+        else:
+            condition, cond_params = "b.status = ?", (status,)
+        where, params = ["1=1"], []
+        if provider_id is not None:
+            where.append("i.provider_id = ?")
+            params.append(provider_id)
+        if item_kind in ROOT_KINDS:
+            where.append("i.kind = ?")
+            params.append(item_kind)
+        if title.strip():
+            where.append("i.title LIKE ? ESCAPE '\\'")
+            params.append("%" + title.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        plugins = ", ".join("?" for _ in plugin_ids)
+        base = f"""
+            WITH items AS (
+                SELECT 'movie' AS kind, provider_id, category_id, stream_id AS item_id, title, year
+                FROM movies WHERE status = 'active'
+                UNION ALL
+                SELECT 'series' AS kind, provider_id, category_id, series_id AS item_id, title, year
+                FROM series WHERE status = 'active'
+            )
+            SELECT {{columns}} FROM items i
+            JOIN providers p ON p.id = i.provider_id
+            LEFT JOIN categories c ON c.provider_id = i.provider_id AND c.content_type = i.kind
+                                  AND c.category_id = i.category_id
+            WHERE {' AND '.join(where)} AND {"NOT " if negate else ""}EXISTS (
+                SELECT 1 FROM scraper_bindings b
+                WHERE b.item_kind = i.kind AND b.provider_id = i.provider_id AND b.category_id = i.category_id
+                  AND b.item_id = i.item_id AND b.plugin_id IN ({plugins}) AND {condition})
+        """
+        all_params = tuple(params) + tuple(plugin_ids) + tuple(cond_params)
+        if negate:
+            base += f"""AND EXISTS (
+                SELECT 1 FROM scraper_bindings b
+                WHERE b.item_kind = i.kind AND b.provider_id = i.provider_id AND b.category_id = i.category_id
+                  AND b.item_id = i.item_id AND b.plugin_id IN ({plugins}))
+            """
+            all_params += tuple(plugin_ids)
+        total = self.db.query_one(base.replace("{columns}", "COUNT(*) AS n"), all_params)["n"]
+        rows = self.db.query(
+            base.replace("{columns}", "i.kind, i.provider_id, i.category_id, i.item_id, i.title, i.year, "
+                                "p.name AS provider_name, c.name AS category_name")
+            + " ORDER BY i.title COLLATE NOCASE, i.provider_id, i.kind, i.category_id, i.item_id LIMIT ? OFFSET ?",
+            all_params + (int(limit), int(offset)))
+        return int(total), [dict(r) for r in rows]
 
     def binding_counts(self, provider_id: Optional[int] = None) -> dict[str, dict[str, int]]:
         where, params = ("WHERE provider_id = ?", (provider_id,)) if provider_id is not None else ("", ())

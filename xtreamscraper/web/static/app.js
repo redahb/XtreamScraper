@@ -57,6 +57,7 @@ function showTab(name) {
   if (name === "settings") loadSettings();
   if (name === "logs") loadLogs();
   if (name === "scrapers") loadScrapers();
+  if (name === "unmatched") loadUnmatched(false);
   if (name === "metadata-history") loadMetadataHistory();
   if (name === "artwork") { loadArtwork(); loadArtworkHistory(); }
   if (name === "about") loadAbout();
@@ -140,7 +141,7 @@ function probeCell(p) {
 function metadataCell(m) {
   if (!m) return '<span class="muted">never</span>';
   return `${badge(m.status)} <span class="small">${fmtTime(m.started_at)}</span><br>
-    <span class="small muted">${m.matched ?? 0} matched · ${m.updated ?? 0} updated · ${m.unmatched ?? 0} unmatched · ${m.ambiguous ?? 0} ambiguous · ${m.error_count} err</span>`;
+    <span class="small muted">${m.matched ?? 0} matched · ${m.updated ?? 0} updated · ${m.unmatched ?? 0} unmatched (${m.ambiguous ?? 0} ambiguous) · ${m.error_count} err</span>`;
 }
 
 function connCell(p) {
@@ -527,6 +528,211 @@ async function loadMetadataHistory() {
     : '<tr><td colspan="15" class="muted">No metadata history.</td></tr>';
 }
 
+
+// ---------------------------------------------------------------------------------------
+// Unmatched media & manual matching
+// ---------------------------------------------------------------------------------------
+const unmatched = { offset: 0, limit: 50, total: 0, items: [], types: null, current: null, request: null, qTimer: null };
+const UM_STATUS = { matched: "matched", unmatched: "unmatched", ambiguous: "ambiguous", invalid_binding: "match gone",
+  not_found: "not found", api_error: "source error" };
+const KIND_NAMES = { movie: "Movie", series: "Series" };
+
+async function manualTypes(reload) {
+  if (!unmatched.types || reload) unmatched.types = (await api("GET", "/metadata/manual-id-types")).plugins;
+  return unmatched.types;
+}
+
+function fillSelect(sel, options, allLabel) {
+  const current = sel.value;
+  sel.innerHTML = `<option value="">${esc(allLabel)}</option>` +
+    options.map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("");
+  sel.value = options.some(([value]) => String(value) === current) ? current : "";
+}
+
+async function loadUnmatched(resetPage) {
+  const types = await manualTypes(true);
+  fillSelect($("#um-provider"), state.providers.map((p) => [p.id, p.name]), "All providers");
+  fillSelect($("#um-plugin"), types.map((p) => [p.plugin_id, p.name]), "All scrapers");
+  if (resetPage) unmatched.offset = 0;
+  const params = new URLSearchParams({ status: $("#um-status").value, limit: unmatched.limit, offset: unmatched.offset });
+  if ($("#um-provider").value) params.set("provider_id", $("#um-provider").value);
+  if ($("#um-type").value) params.set("type", $("#um-type").value);
+  if ($("#um-plugin").value) params.set("plugin_id", $("#um-plugin").value);
+  if ($("#um-q").value.trim()) params.set("q", $("#um-q").value.trim());
+  const data = await api("GET", "/metadata/unmatched?" + params);
+  unmatched.items = data.items;
+  unmatched.total = data.total;
+  if (data.offset && !data.items.length) { unmatched.offset = 0; return loadUnmatched(false); }
+  $("#um-list").innerHTML = data.items.length ? data.items.map((item, i) => `<tr>
+    <td><strong>${esc(item.title)}</strong>${item.year ? ` (${item.year})` : ""}<br>
+      <span class="badge ${item.matched ? "s-matched" : "s-unmatched"}">${item.matched ? "Matched" : "Unmatched"}</span></td>
+    <td>${esc(KIND_NAMES[item.item_kind])}</td>
+    <td>${esc(item.provider_name)}<br><span class="small muted">${esc(item.category_name || "#" + item.category_id)}</span></td>
+    <td>${item.plugins.map((p) => `<div class="um-plugin"><span class="badge s-${esc(p.status)}">${esc(p.name)}: ${esc(UM_STATUS[p.status] || p.status)}</span>
+      ${p.manual ? '<span class="small">set by hand</span>' : ""}
+      ${p.message && p.status !== "matched" ? `<span class="small muted">${esc(p.message)}</span>` : ""}</div>`).join("")}</td>
+    <td class="small">${fmtTime(item.last_attempt)}</td>
+    <td><button data-action="um-open" data-index="${i}">Fix match</button></td></tr>`).join("")
+    : '<tr><td colspan="6" class="muted">Nothing to show for these filters.</td></tr>';
+  const first = data.total ? data.offset + 1 : 0;
+  $("#um-page").textContent = `${first}–${data.offset + data.items.length} of ${data.total}`;
+  $('[data-action="um-prev"]').disabled = data.offset === 0;
+  $('[data-action="um-next"]').disabled = data.offset + data.items.length >= data.total;
+}
+
+function itemKey(item) {
+  return { item_kind: item.item_kind, provider_id: item.provider_id, category_id: item.category_id, item_id: item.item_id };
+}
+
+function bindingHtml(item, b, plugin) {
+  const native = plugin && plugin.native_namespace;
+  const canUse = native && (plugin.manual_id_fields[item.item_kind] || []).some((f) => f.namespace === native);
+  const matched = b.status === "matched" && b.remote_id
+    ? `<p class="small">Matched to <strong>${esc(b.matched_title || b.remote_id)}</strong>${b.matched_year ? ` (${b.matched_year})` : ""},
+        ID ${esc(b.remote_id)}${b.manual ? " · <strong>set by hand</strong>: " + Object.entries(b.manual_ids).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(", ") : ""}</p>` : "";
+  const actions = b.manual
+    ? `<button data-action="um-change" data-plugin="${esc(b.plugin_id)}">Change ID</button>
+       <button class="danger" data-action="um-remove" data-plugin="${esc(b.plugin_id)}">Remove manual match</button>`
+    : (plugin ? `<button data-action="um-change" data-plugin="${esc(b.plugin_id)}">Enter ID</button>` : "");
+  const candidates = b.candidates.length ? `<table><thead><tr><th>Candidate</th><th>Year</th><th>Score</th><th>ID</th><th></th></tr></thead><tbody>
+    ${b.candidates.map((c, i) => `<tr><td>${esc(c.title || "–")}</td><td>${esc(c.year ?? "–")}</td>
+      <td>${c.score != null ? esc(Math.round(c.score)) : "–"}</td><td class="small">${esc(c.remote_id)}</td>
+      <td>${canUse ? `<button data-action="um-candidate" data-plugin="${esc(b.plugin_id)}" data-candidate="${i}">Use this match</button>` : ""}</td></tr>`).join("")}
+    </tbody></table>` : "";
+  return `<div class="um-binding"><strong>${esc(b.name)}</strong> <span class="badge s-${esc(b.status)}">${esc(UM_STATUS[b.status] || b.status)}</span>
+    <span class="small muted">last attempt ${fmtTime(b.last_attempt)}</span>
+    ${b.message ? `<p class="small muted">${esc(b.message)}</p>` : ""}${matched}${candidates}
+    <div class="toolbar small">${actions}</div></div>`;
+}
+
+function openUnmatched(index) {
+  const item = unmatched.items[Number(index)];
+  unmatched.current = item;
+  unmatched.request = null;
+  const plugins = unmatched.types.filter((p) => p.media_types.includes(item.item_kind));
+  const byId = Object.fromEntries(unmatched.types.map((p) => [p.plugin_id, p]));
+  const el = $("#um-detail");
+  el.innerHTML = `<h2>${esc(item.title)}${item.year ? ` (${item.year})` : ""} – ${esc(KIND_NAMES[item.item_kind])}</h2>
+    <p class="small muted">${esc(item.provider_name)} · ${esc(item.category_name || "#" + item.category_id)} · Xtream ID ${esc(item.item_id)}</p>
+    ${item.plugins.map((b) => bindingHtml(item, b, byId[b.plugin_id])).join("")}
+    <h3>Set an ID by hand</h3>
+    ${plugins.length ? `<form id="um-form" autocomplete="off">
+      <div class="grid">
+        <label>Scraper<select name="plugin_id">${plugins.map((p) => `<option value="${esc(p.plugin_id)}">${esc(p.name)}${
+          !p.configured ? " (not configured)" : !p.enabled ? " (disabled)" : ""}</option>`).join("")}</select></label>
+        <label>ID type<select name="namespace"></select></label>
+        <label>ID<input name="id_value"><span class="small muted" id="um-help"></span></label>
+      </div>
+      <div class="toolbar"><button type="submit" class="primary">Check ID</button>
+        <button type="button" data-action="um-close">Close</button><span id="um-result"></span></div>
+    </form>
+    <div id="um-preview" class="hidden"></div>`
+    : '<p class="muted">No installed scraper accepts IDs for this type.</p><div class="toolbar"><button data-action="um-close">Close</button></div>'}`;
+  el.classList.remove("hidden");
+  if (plugins.length) {
+    fillNamespaces();
+    $("#um-form").addEventListener("submit", (ev) => { ev.preventDefault(); verifyManual(); });
+  }
+  el.scrollIntoView({ behavior: "smooth" });
+}
+
+function fillNamespaces(selected) {
+  const form = $("#um-form");
+  const plugin = unmatched.types.find((p) => p.plugin_id === form.plugin_id.value);
+  const fields = (plugin && plugin.manual_id_fields[unmatched.current.item_kind]) || [];
+  form.namespace.innerHTML = fields.map((f) => `<option value="${esc(f.namespace)}">${esc(f.label)}</option>`).join("");
+  if (selected) form.namespace.value = selected;
+  showFieldHelp();
+}
+
+function showFieldHelp() {
+  const form = $("#um-form");
+  const plugin = unmatched.types.find((p) => p.plugin_id === form.plugin_id.value);
+  const field = ((plugin && plugin.manual_id_fields[unmatched.current.item_kind]) || []).find((f) => f.namespace === form.namespace.value);
+  form.id_value.placeholder = field ? field.placeholder : "";
+  let help = field ? field.help : "";
+  if (plugin && !plugin.configured) help += " This scraper is not configured, so the ID cannot be checked yet.";
+  else if (plugin && !plugin.enabled) help += " This scraper is disabled: the match is saved, and used once you enable it.";
+  $("#um-help").textContent = help.trim();
+  $("#um-preview").classList.add("hidden");
+}
+
+function idList(ids) {
+  return Object.entries(ids || {}).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(" · ");
+}
+
+async function verifyManual() {
+  const form = $("#um-form");
+  const body = { ...itemKey(unmatched.current), plugin_id: form.plugin_id.value, namespace: form.namespace.value, value: form.id_value.value };
+  $("#um-result").textContent = "Checking…";
+  $("#um-preview").classList.add("hidden");
+  let res;
+  try {
+    res = await api("POST", "/metadata/manual-match", body);
+  } catch (e) {
+    $("#um-result").textContent = "";
+    toast(e.message, true);
+    return;
+  }
+  $("#um-result").textContent = "";
+  unmatched.request = body;
+  const v = res.verified;
+  const current = v.current && v.current.remote_id !== v.remote_id
+    ? `<p class="small">This replaces the current ${v.current.manual ? "manual " : ""}match: ${esc(v.current.title || v.current.remote_id)}${v.current.year ? ` (${v.current.year})` : ""}.</p>` : "";
+  const preview = $("#um-preview");
+  preview.className = "um-preview";
+  preview.innerHTML = `<p>${esc(v.plugin_name)} found <strong>${esc(v.title || "(no title)")}</strong>${v.year ? ` (${v.year})` : ""} for ${esc(v.namespace_label)} ${esc(v.value)}.</p>
+    <p class="small muted">IDs at the source: ${idList(v.external_ids) || "–"}</p>
+    <p class="small">Saved as final, never changed by any scraper: ${idList(v.manual_ids)}</p>${current}
+    <p class="um-warn"><strong>Warning:</strong> Confirm fetches this ${esc(KIND_NAMES[unmatched.current.item_kind] || "item").toLowerCase()} from ${esc(v.plugin_name)} straight away
+      (or at the next scrape if that cannot run now). The title, plot and all other details in the NFO <strong>are cleared and rebuilt</strong>
+      from what the scrapers return, with ${esc(v.plugin_name)} winning even with Overwrite off. Its artwork <strong>replaces</strong> the managed images,
+      and images left from the old match are <strong>removed</strong>${unmatched.current.item_kind === "series" ? ". This covers every season and episode too" : ""}.
+      Changes you made by hand to those NFO fields are lost. This happens once; after that the normal Overwrite setting applies.
+      Image files you added yourself are never replaced or removed.</p>
+    <div class="toolbar"><button class="primary" data-action="um-confirm">Confirm</button>
+      <button data-action="um-cancel">Cancel</button></div>`;
+}
+
+async function confirmManual() {
+  if (!unmatched.request) return;
+  try {
+    const res = await api("POST", "/metadata/manual-match", { ...unmatched.request, confirm: true });
+    toast(res.job ? `Saved. Refreshing details and artwork: ${res.job.description}`
+      : `Saved. ${res.note || "Details and artwork are replaced at the next scrape."}`);
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  $("#um-detail").classList.add("hidden");
+  refreshStatus();
+  loadUnmatched(false);
+}
+
+async function removeManual(pluginId) {
+  const b = unmatched.current.plugins.find((p) => p.plugin_id === pluginId);
+  if (!confirm(`Remove the ${b ? b.name : ""} match set by hand for "${unmatched.current.title}"?\n\nThe IDs are taken out of the NFO (if unchanged) and the item is matched automatically again. No files are deleted.`)) return;
+  try {
+    const res = await api("POST", "/metadata/manual-match/remove", { ...itemKey(unmatched.current), plugin_id: pluginId });
+    toast(res.job ? `Removed. Started: ${res.job.description}` : `Removed. ${res.note || ""}`.trim());
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  $("#um-detail").classList.add("hidden");
+  refreshStatus();
+  loadUnmatched(false);
+}
+
+function selectPlugin(pluginId, namespace) {
+  const form = $("#um-form");
+  if (!form) return false;
+  form.plugin_id.value = pluginId;
+  if (form.plugin_id.value !== pluginId) return false;
+  fillNamespaces(namespace);
+  return true;
+}
+
 // ---------------------------------------------------------------------------------------
 // Artwork
 // ---------------------------------------------------------------------------------------
@@ -678,6 +884,22 @@ const actions = {
   "scraper-test-form": async () => { $("#scraper-config-result").textContent = "Testing…"; $("#scraper-config-result").innerHTML = await testScraper(scraperPage.id, scraperFormValues()); },
   "scraper-back": () => showTab("scrapers"),
   "reload-metadata-history": () => loadMetadataHistory(),
+  "um-reload": () => loadUnmatched(false),
+  "um-prev": () => { unmatched.offset = Math.max(0, unmatched.offset - unmatched.limit); return loadUnmatched(false); },
+  "um-next": () => { unmatched.offset += unmatched.limit; return loadUnmatched(false); },
+  "um-open": (btn) => openUnmatched(btn.dataset.index),
+  "um-close": () => $("#um-detail").classList.add("hidden"),
+  "um-change": (btn) => { if (selectPlugin(btn.dataset.plugin)) $("#um-form").id_value.focus(); },
+  "um-remove": (btn) => removeManual(btn.dataset.plugin),
+  "um-candidate": (btn) => {
+    const b = unmatched.current.plugins.find((p) => p.plugin_id === btn.dataset.plugin);
+    const plugin = unmatched.types.find((p) => p.plugin_id === btn.dataset.plugin);
+    if (!b || !plugin || !selectPlugin(plugin.plugin_id, plugin.native_namespace)) return;
+    $("#um-form").id_value.value = b.candidates[Number(btn.dataset.candidate)].remote_id;
+    return verifyManual();
+  },
+  "um-confirm": () => confirmManual(),
+  "um-cancel": () => { unmatched.request = null; $("#um-preview").classList.add("hidden"); },
   "reload-artwork-history": () => loadArtworkHistory(),
   "artwork-reconcile": () => startArtworkJob(false),
   "artwork-force": () => startArtworkJob(true),
@@ -710,6 +932,12 @@ document.addEventListener("change", async (ev) => {
   } else if (t.classList.contains("provider-filter")) {
     t.id.startsWith("sync") ? loadSyncHistory() : t.id.startsWith("probe") ? loadProbeHistory()
       : t.id.startsWith("artwork") ? loadArtworkHistory() : loadMetadataHistory();
+  } else if (t.classList.contains("um-filter")) {
+    loadUnmatched(true).catch((e) => toast(e.message, true));
+  } else if (t.form && t.form.id === "um-form" && t.name === "plugin_id") {
+    fillNamespaces();
+  } else if (t.form && t.form.id === "um-form" && t.name === "namespace") {
+    showFieldHelp();
   } else if (t.dataset.action === "scraper-enabled" || t.dataset.action === "scraper-overwrite") {
     const field = t.dataset.action === "scraper-enabled" ? "enabled" : "overwrite";
     try { await api("POST", `/scrapers/${encodeURIComponent(t.dataset.id)}/${field}`, { [field]: t.checked }); } catch (e) { toast(e.message, true); }
@@ -719,6 +947,14 @@ document.addEventListener("change", async (ev) => {
 
 document.addEventListener("input", (ev) => {
   if (ev.target.dataset.filter) { captureSelection(); renderCategories(); }
+  if (ev.target.id === "um-q") {
+    clearTimeout(unmatched.qTimer);
+    unmatched.qTimer = setTimeout(() => loadUnmatched(true).catch((e) => toast(e.message, true)), 300);
+  }
+  if (ev.target.form && ev.target.form.id === "um-form" && ev.target.name === "id_value") {
+    unmatched.request = null;
+    $("#um-preview").classList.add("hidden");
+  }
 });
 
 $("#provider-edit").addEventListener("submit", saveProvider);

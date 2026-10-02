@@ -35,6 +35,9 @@ class MovieRecord:
     last_seen: str
     last_updated: str
     last_synced: str
+    missing_since: Optional[str] = None
+    quarantined_at: Optional[str] = None
+    quarantine_path: Optional[str] = None
 
 
 @dataclass
@@ -56,6 +59,7 @@ class SeriesRecord:
     last_seen: str
     last_updated: str
     last_synced: str
+    missing_since: Optional[str] = None
 
 
 @dataclass
@@ -78,6 +82,9 @@ class EpisodeRecord:
     last_seen: str
     last_updated: str
     last_synced: str
+    missing_since: Optional[str] = None
+    quarantined_at: Optional[str] = None
+    quarantine_path: Optional[str] = None
 
 
 def _from_row(cls, row):
@@ -115,27 +122,21 @@ class SyncStateRepository:
     def upsert_movie(self, record: MovieRecord) -> None:
         self.upsert_movies([record])
 
-    def touch_movies(self, provider_id: int, category_id: str, stream_ids: Iterable[str], now: str) -> None:
-        with self.db.transaction() as conn:
-            conn.executemany(
-                "UPDATE movies SET last_seen = ?, last_synced = ?, status = 'active' "
-                "WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
-                [(now, now, provider_id, category_id, sid) for sid in stream_ids],
-            )
-
-    def mark_missing_movies(self, provider_id: int, category_id: str, seen_ids: set[str]) -> int:
-        existing = self.db.query(
-            "SELECT stream_id FROM movies WHERE provider_id = ? AND category_id = ? AND status = 'active'",
-            (provider_id, category_id),
+    def mark_movie_missing(self, provider_id: int, category_id: str, stream_id: str, now: str) -> None:
+        """Start (or keep) the missing lifecycle; ``missing_since`` is set only once."""
+        self.db.execute(
+            "UPDATE movies SET status = 'missing', missing_since = COALESCE(missing_since, ?) "
+            "WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
+            (now, provider_id, category_id, stream_id),
         )
-        gone = [r["stream_id"] for r in existing if r["stream_id"] not in seen_ids]
-        if gone:
-            with self.db.transaction() as conn:
-                conn.executemany(
-                    "UPDATE movies SET status = 'missing' WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
-                    [(provider_id, category_id, sid) for sid in gone],
-                )
-        return len(gone)
+
+    def set_movie_quarantine(self, provider_id: int, category_id: str, stream_id: str, now: str,
+                             path: Optional[str]) -> None:
+        self.db.execute(
+            "UPDATE movies SET quarantined_at = ?, quarantine_path = ? "
+            "WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
+            (now, path, provider_id, category_id, stream_id),
+        )
 
     # -- series --------------------------------------------------------------------------
     def series_in_category(self, provider_id: int, category_id: str) -> dict[str, SeriesRecord]:
@@ -148,28 +149,12 @@ class SyncStateRepository:
         with self.db.transaction() as conn:
             _upsert(conn, "series", record, ("provider_id", "category_id", "series_id"))
 
-    def mark_missing_series(self, provider_id: int, category_id: str, seen_ids: set[str]) -> tuple[int, int]:
-        """Mark vanished series (and their episodes) missing. Returns (series, episodes)."""
-        existing = self.db.query(
-            "SELECT series_id FROM series WHERE provider_id = ? AND category_id = ? AND status = 'active'",
-            (provider_id, category_id),
+    def mark_series_missing(self, provider_id: int, category_id: str, series_id: str, now: str) -> None:
+        self.db.execute(
+            "UPDATE series SET status = 'missing', missing_since = COALESCE(missing_since, ?) "
+            "WHERE provider_id = ? AND category_id = ? AND series_id = ?",
+            (now, provider_id, category_id, series_id),
         )
-        gone = [r["series_id"] for r in existing if r["series_id"] not in seen_ids]
-        episodes = 0
-        if gone:
-            with self.db.transaction() as conn:
-                for sid in gone:
-                    conn.execute(
-                        "UPDATE series SET status = 'missing' WHERE provider_id = ? AND category_id = ? AND series_id = ?",
-                        (provider_id, category_id, sid),
-                    )
-                    cur = conn.execute(
-                        "UPDATE episodes SET status = 'missing' WHERE provider_id = ? AND category_id = ? "
-                        "AND series_id = ? AND status = 'active'",
-                        (provider_id, category_id, sid),
-                    )
-                    episodes += cur.rowcount
-        return len(gone), episodes
 
     # -- episodes ------------------------------------------------------------------------
     def episodes_of_series(self, provider_id: int, category_id: str, series_id: str) -> dict[str, EpisodeRecord]:
@@ -192,17 +177,42 @@ class SyncStateRepository:
                 (now, now, provider_id, category_id, series_id),
             )
 
-    def mark_missing_episodes(self, provider_id: int, category_id: str, series_id: str, seen_ids: set[str]) -> int:
-        existing = self.episodes_of_series(provider_id, category_id, series_id)
-        gone = [eid for eid, rec in existing.items() if rec.status == ACTIVE and eid not in seen_ids]
-        if gone:
+    def move_episode_paths(self, provider_id: int, category_id: str, series_id: str, old_folder: str,
+                           new_folder: str) -> None:
+        """The series folder was moved: keep stored episode paths (incl. quarantined ones) valid."""
+        old = old_folder.rstrip("/\\")
+        updates = []
+        for record in self.episodes_of_series(provider_id, category_id, series_id).values():
+            paths = []
+            for path in (record.strm_path, record.quarantine_path):
+                if path and path.startswith(old) and path[len(old):len(old) + 1] in ("/", "\\"):
+                    path = new_folder.rstrip("/\\") + path[len(old):]
+                paths.append(path)
+            if paths != [record.strm_path, record.quarantine_path]:
+                updates.append((*paths, provider_id, category_id, series_id, record.episode_id))
+        if updates:
             with self.db.transaction() as conn:
                 conn.executemany(
-                    "UPDATE episodes SET status = 'missing' WHERE provider_id = ? AND category_id = ? "
-                    "AND series_id = ? AND episode_id = ?",
-                    [(provider_id, category_id, series_id, eid) for eid in gone],
+                    "UPDATE episodes SET strm_path = ?, quarantine_path = ? "
+                    "WHERE provider_id = ? AND category_id = ? AND series_id = ? AND episode_id = ?",
+                    updates,
                 )
-        return len(gone)
+
+    def mark_episode_missing(self, provider_id: int, category_id: str, series_id: str, episode_id: str,
+                             now: str) -> None:
+        self.db.execute(
+            "UPDATE episodes SET status = 'missing', missing_since = COALESCE(missing_since, ?) "
+            "WHERE provider_id = ? AND category_id = ? AND series_id = ? AND episode_id = ?",
+            (now, provider_id, category_id, series_id, episode_id),
+        )
+
+    def set_episode_quarantine(self, provider_id: int, category_id: str, series_id: str, episode_id: str,
+                               now: str, path: Optional[str]) -> None:
+        self.db.execute(
+            "UPDATE episodes SET quarantined_at = ?, quarantine_path = ? "
+            "WHERE provider_id = ? AND category_id = ? AND series_id = ? AND episode_id = ?",
+            (now, path, provider_id, category_id, series_id, episode_id),
+        )
 
     # -- summaries -----------------------------------------------------------------------
     def counts(self, provider_id: int) -> dict[str, int]:

@@ -224,6 +224,11 @@ class ArtworkRepository:
         with self.db.transaction() as conn:
             conn.execute("UPDATE artwork_nfo_refs SET nfo_path = ? WHERE id = ?", (new_nfo_path, ref_id))
 
+    def delete_slot(self, slot_id: int) -> None:
+        """Forget a slot that no longer owns any file or NFO reference."""
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM artwork_slots WHERE id = ?", (slot_id,))
+
     def forget_ref(self, ref_id: int) -> None:
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM artwork_nfo_refs WHERE id = ?", (ref_id,))

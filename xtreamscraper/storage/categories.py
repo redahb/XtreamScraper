@@ -22,6 +22,8 @@ class CategoryRecord:
     selected: bool
     present: bool
     folder_name: Optional[str]
+    #: consecutive successful syncs that returned no items (see the sync engine's empty check)
+    empty_syncs: int = 0
 
     def public_dict(self) -> dict:
         return {
@@ -41,6 +43,7 @@ def _row(r) -> CategoryRecord:
         selected=bool(r["selected"]),
         present=bool(r["present"]),
         folder_name=r["folder_name"],
+        empty_syncs=int(r["empty_syncs"] or 0),
     )
 
 
@@ -109,3 +112,9 @@ class CategoryRepository:
                 "UPDATE categories SET folder_name = ? WHERE provider_id = ? AND content_type = ? AND category_id = ?",
                 (folder_name, provider_id, content_type, category_id),
             )
+
+    def set_empty_syncs(self, provider_id: int, content_type: str, category_id: str, count: int) -> None:
+        self.db.execute(
+            "UPDATE categories SET empty_syncs = ? WHERE provider_id = ? AND content_type = ? AND category_id = ?",
+            (count, provider_id, content_type, category_id),
+        )

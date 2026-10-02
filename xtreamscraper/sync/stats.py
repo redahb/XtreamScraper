@@ -30,6 +30,16 @@ class SyncStats:
     episodes_unchanged: int = 0
     episodes_failed: int = 0
     episodes_missing: int = 0
+    movies_quarantined: int = 0
+    episodes_quarantined: int = 0
+    movies_restored: int = 0
+    episodes_restored: int = 0
+    movies_purged: int = 0
+    series_purged: int = 0
+    episodes_purged: int = 0
+    files_purged: int = 0
+    purge_failures: int = 0
+    categories_unconfirmed: int = 0  # empty or no longer listed: nothing marked missing
     files_recreated: int = 0
     items_relocated: int = 0
     name_collisions: int = 0

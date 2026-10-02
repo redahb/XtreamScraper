@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Optional
+
+from ..filesystem import atomic
 
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: str) -> Optional[str]:
+    """SHA-256 of a file's bytes, or None when it cannot be read."""
+    try:
+        return hashlib.sha256(atomic.read_bytes(path)).hexdigest()
+    except OSError:
+        return None
 
 
 def url_fingerprint(url: str) -> str:

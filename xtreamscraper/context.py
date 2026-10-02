@@ -9,6 +9,7 @@ from .config.paths import AppPaths
 from .config.settings import SettingsStore
 from .jobs.manager import JobManager
 from .metadata.manager import ScraperManager
+from .metadata.manual_matching import ManualMatchService
 from .metadata.registry import PluginRegistry
 from .storage.categories import CategoryRepository
 from .storage.db import Database
@@ -32,6 +33,7 @@ class AppContext:
     jobs: JobManager
     scrapers: Optional[ScraperManager] = None
     metadata_history: Optional[MetadataHistoryRepository] = None
+    manual_matching: Optional[ManualMatchService] = None
     log_path: str = ""
     # Factory for Xtream clients: (provider, settings, **overrides) -> client. Tests replace it.
     client_factory: Optional[Callable] = None
@@ -74,6 +76,7 @@ def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[
         client_factory=client_factory,
         scrapers=scrapers,
         metadata_history=metadata_history,
+        manual_matching=ManualMatchService(db, scrapers, jobs),
     )
     ctx.extra["interrupted_jobs"] = interrupted
     return ctx

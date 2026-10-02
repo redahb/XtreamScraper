@@ -17,6 +17,7 @@ the request limit is reached or the key is rejected (``ScraperSession.suspended`
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable, Optional
 
 from xtreamscraper.artwork.download import ArtworkDownloadError, validate_image
@@ -31,6 +32,8 @@ from xtreamscraper.metadata.plugin import (
     ConfigError,
     ConfigField,
     FieldType,
+    ManualIdError,
+    ManualIdField,
     ScraperPlugin,
     ScraperSession,
     TestAction,
@@ -71,6 +74,7 @@ MAX_SEARCH_PAGES = 3
 PAGE_SIZE = 10
 MAX_POSTER_HEIGHT = 3000
 TEST_TITLE = "tt0111161"  # a well-known title for connection tests
+_IMDB_URL = re.compile(r"imdb\.com/title/(tt\d{5,})(?:\D|$)", re.IGNORECASE)
 
 # Status entries shown on the settings page
 MAIN_API, POSTER_API, LAST_SUCCESS, LAST_JOB = ("Main API", "Poster API", "Last successful request",
@@ -329,6 +333,22 @@ class OMDbPlugin(ScraperPlugin):
             ConfigField("poster_base_url", "Poster API base URL", default=POSTER_BASE, advanced=True,
                         help="Change only if OMDb gave you a private Poster API URL."),
         ]
+
+    def manual_id_fields(self, media_type: str) -> list[ManualIdField]:
+        if media_type not in ("movie", "series"):
+            return []
+        return [ManualIdField("imdb", "IMDb ID", help="OMDb uses IMDb IDs. An IMDb link works too.",
+                              placeholder="tt0133093", pattern_hint="tt + digits")]
+
+    def normalize_manual_id(self, namespace: str, value: str) -> str:
+        if namespace != "imdb":
+            raise ManualIdError("OMDb only accepts IMDb IDs")
+        text = (value or "").strip()
+        match = _IMDB_URL.search(text)
+        found = imdb_id(match.group(1).lower() if match else text.lower())
+        if not found:
+            raise ManualIdError("An IMDb ID looks like tt0133093")
+        return found
 
     def validate_config(self, values: dict[str, Any]) -> dict[str, Any]:
         clean = validate_against_schema(self.config_schema(), values)

@@ -15,6 +15,7 @@
       <button data-tab="sync-history">Sync history</button>
       <button data-tab="probe-history">Probe history</button>
       <button data-tab="scrapers">Metadata Scrapers</button>
+      <button data-tab="unmatched">Unmatched</button>
       <button data-tab="metadata-history">Metadata history</button>
       <button data-tab="artwork">Artwork</button>
       <button data-tab="settings">Settings</button>
@@ -169,6 +170,42 @@
       </div>
     </section>
 
+    <!-- Unmatched media and manual matching -->
+    <section id="tab-unmatched" class="tab hidden">
+      <p class="muted small">Movies and series a scraper could not match, per scraper. Fix one by entering an ID the
+        scraper understands: it is checked with the scraper first and saved only after you confirm. An ID set by hand
+        is final: no scraper ever changes it, until you change or remove it here.</p>
+      <div class="toolbar">
+        <label>Provider <select id="um-provider" class="um-filter"></select></label>
+        <label>Type <select id="um-type" class="um-filter">
+          <option value="">Movies + Series</option><option value="movie">Movies</option><option value="series">Series</option>
+        </select></label>
+        <label>Scraper <select id="um-plugin" class="um-filter"></select></label>
+        <label>Status <select id="um-status" class="um-filter">
+          <option value="unmatched">Unmatched</option>
+          <option value="ambiguous">Ambiguous</option>
+          <option value="invalid_binding">Match no longer exists</option>
+          <option value="not_found">Not found</option>
+          <option value="matched">Matched</option>
+          <option value="manual">Set by hand</option>
+        </select></label>
+        <input id="um-q" class="filter" placeholder="Title…">
+        <button data-action="um-reload">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Title</th><th>Type</th><th>Provider / category</th><th>Scrapers</th><th>Last attempt</th><th></th></tr></thead>
+          <tbody id="um-list"></tbody>
+        </table>
+      </div>
+      <div class="toolbar">
+        <button data-action="um-prev">Previous</button>
+        <span id="um-page" class="muted small"></span>
+        <button data-action="um-next">Next</button>
+      </div>
+      <div id="um-detail" class="card hidden"></div>
+    </section>
+
     <!-- A scraper's own configuration page -->
     <section id="tab-scraper-config" class="tab hidden">
       <form id="scraper-config-form" class="card" autocomplete="off">
@@ -196,7 +233,7 @@
       <div class="table-wrap">
         <table>
           <thead><tr><th>Provider</th><th>Started</th><th>Scope</th><th>Duration</th><th>Result</th>
-            <th>Considered</th><th>Matched</th><th>Unmatched</th><th>Ambiguous</th><th>Updated</th><th>Unchanged</th>
+            <th>Considered</th><th>Matched</th><th>Unmatched</th><th>of which ambiguous</th><th>Updated</th><th>Unchanged</th>
             <th>Skipped</th><th>Errors</th><th>Scrapers</th><th></th></tr></thead>
           <tbody id="metadata-history"></tbody>
         </table>
@@ -305,7 +342,12 @@
         <div class="grid">
           <label>Default target folder<input name="default_target_folder" placeholder="D:\XtreamLibrary"></label>
           <label>Max. file/folder name length<input name="max_name_length" type="number" min="40" max="200"></label>
+          <label>Permanently remove managed files for missing items after N days (0 = never)<input name="missing_purge_days" type="number" min="0" max="3650"></label>
         </div>
+        <p class="muted small">When the provider stops listing an item, its .strm is renamed to .strm.bak at once, so
+          media servers stop showing it; its NFO and artwork stay. If it comes back, it is restored. A permanent removal
+          only happens during a successful sync that confirms the item is still gone, and only deletes files this
+          application created and nobody changed.</p>
         <div class="checks">
           <label><input type="checkbox" name="clean_titles"> Clean provider tags from titles (|EN|, 4K, HEVC…)</label>
           <label><input type="checkbox" name="episode_title_in_filename"> Add trustworthy episode titles to episode file names</label>

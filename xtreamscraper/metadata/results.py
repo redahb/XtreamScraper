@@ -39,6 +39,7 @@ class MatchMethod(str, enum.Enum):
     TITLE_YEAR = "title_year"
     TITLE_ONLY = "title_only"
     PARENT = "parent"  # seasons/episodes resolved through the matched series
+    MANUAL_ID = "manual_id"  # an ID the user entered by hand and confirmed (authoritative)
 
 
 @dataclass
@@ -138,4 +139,31 @@ class FetchOutcome:
 
     @classmethod
     def unsupported(cls) -> "FetchOutcome":
+        return cls(FetchStatus.UNSUPPORTED)
+
+
+@dataclass
+class ResolveOutcome:
+    """Result of turning an alternate manual ID (e.g. an IMDb ID given to a plugin whose own IDs
+    are different) into the plugin's native remote ID. Only the supplied ID is used: never a
+    title search."""
+
+    status: FetchStatus
+    remote_id: Optional[str] = None
+    message: Optional[str] = None
+
+    @classmethod
+    def ok(cls, remote_id: str) -> "ResolveOutcome":
+        return cls(FetchStatus.OK, str(remote_id))
+
+    @classmethod
+    def not_found(cls, message: Optional[str] = None) -> "ResolveOutcome":
+        return cls(FetchStatus.NOT_FOUND, message=message)
+
+    @classmethod
+    def error(cls, message: str) -> "ResolveOutcome":
+        return cls(FetchStatus.API_ERROR, message=message)
+
+    @classmethod
+    def unsupported(cls) -> "ResolveOutcome":
         return cls(FetchStatus.UNSUPPORTED)

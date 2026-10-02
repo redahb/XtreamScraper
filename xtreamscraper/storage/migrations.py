@@ -377,9 +377,47 @@ _V4 = [
     """,
 ]
 
+# v5: missing-item lifecycle (reversible .strm quarantine, optional purge), confirmation of
+# suspicious empty category answers, and ownership of NFO files the application created.
+# Rows that were already 'missing' keep missing_since NULL: their lifecycle starts at the
+# next successful sync that confirms they are still gone, so they are never purged at once.
+_V5 = [
+    "ALTER TABLE movies ADD COLUMN missing_since TEXT",
+    "ALTER TABLE movies ADD COLUMN quarantined_at TEXT",
+    "ALTER TABLE movies ADD COLUMN quarantine_path TEXT",
+    "ALTER TABLE series ADD COLUMN missing_since TEXT",
+    "ALTER TABLE episodes ADD COLUMN missing_since TEXT",
+    "ALTER TABLE episodes ADD COLUMN quarantined_at TEXT",
+    "ALTER TABLE episodes ADD COLUMN quarantine_path TEXT",
+    "ALTER TABLE categories ADD COLUMN empty_syncs INTEGER NOT NULL DEFAULT 0",
+    """
+    CREATE TABLE nfo_files (
+        nfo_path     TEXT PRIMARY KEY,
+        nfo_kind     TEXT NOT NULL,
+        provider_id  INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        item_kind    TEXT NOT NULL CHECK (item_kind IN ('movie', 'series', 'season', 'episode')),
+        category_id  TEXT NOT NULL,
+        item_id      TEXT NOT NULL,
+        file_hash    TEXT NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'managed',
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX idx_nfo_files_item ON nfo_files(provider_id, item_kind, category_id, item_id)",
+]
+
+# v6: IDs a user entered by hand and confirmed (``{namespace: value}``), on the binding that
+# was matched with them. They are the item's authoritative IDs: no plugin may change them.
+_V6 = [
+    "ALTER TABLE scraper_bindings ADD COLUMN manual_ids TEXT NOT NULL DEFAULT '{}'",
+]
+
 MIGRATIONS: list[Migration] = [
     (1, _V1),
     (2, _V2),
     (3, _V3),
     (4, _V4),
+    (5, _V5),
+    (6, _V6),
 ]

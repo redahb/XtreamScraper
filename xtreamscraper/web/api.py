@@ -17,6 +17,7 @@ from ..storage.artwork import ArtworkRepository
 from ..context import AppContext
 from ..jobs.manager import KIND_SCOPES, BusyError
 from ..metadata.engine import ScrapeRequest
+from ..metadata.manual_matching import ManualMatchError
 from ..metadata.plugin import ConfigError
 from ..probe.engine import ProbeRequest
 from ..probe.ffprobe_runner import ProbeError, ffprobe_version
@@ -401,6 +402,47 @@ def build_api(ctx: AppContext) -> Blueprint:
         except BusyError as exc:
             return _error(str(exc), 409)
         return jsonify(job=job.to_dict()), 202
+
+    # -- unmatched media / manual matching ----------------------------------------------------------
+    def manual_error(exc: ManualMatchError):
+        return jsonify(error=redact(exc.message), code=exc.code), exc.http_status
+
+    @api.get("/metadata/manual-id-types")
+    def manual_id_types():
+        return jsonify(plugins=ctx.manual_matching.capabilities())
+
+    @api.get("/metadata/unmatched")
+    def unmatched():
+        args = request.args
+        pid = args.get("provider_id", "")
+        kind = args.get("type", "")
+        try:
+            return jsonify(ctx.manual_matching.overview(
+                provider_id=int(pid) if pid.isdigit() else None, item_kind=None if kind in ("", "all") else kind,
+                plugin_id=args.get("plugin_id") or None, status=args.get("status") or "unmatched",
+                title=args.get("q", "")[:200], limit=int(args.get("limit", 50)), offset=int(args.get("offset", 0))))
+        except ValueError:
+            return _error("limit and offset must be numbers")
+        except ManualMatchError as exc:
+            return manual_error(exc)
+
+    @api.post("/metadata/manual-match")
+    def manual_match():
+        """``confirm: false`` verifies the ID and shows what it points to; ``true`` stores it."""
+        body = _body()
+        try:
+            if _bool(body.get("confirm")):
+                return jsonify(ctx.manual_matching.assign(body))
+            return jsonify(verified=ctx.manual_matching.preview(body))
+        except ManualMatchError as exc:
+            return manual_error(exc)
+
+    @api.post("/metadata/manual-match/remove")
+    def remove_manual_match():
+        try:
+            return jsonify(ctx.manual_matching.remove(_body()))
+        except ManualMatchError as exc:
+            return manual_error(exc)
 
     @api.get("/about")
     def about():

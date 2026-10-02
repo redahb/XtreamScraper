@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..filesystem import atomic
+from ..storage.nfo_files import MANAGED, ItemKey, NfoFileRepository
+from ..utils.hashing import file_sha256
 from .document import NfoDocument, NfoError
 from .paths import NfoKind
 
@@ -57,13 +59,46 @@ class NfoSeed:
             doc.set_text("year", self.year)
 
 
-def update_nfo(path: str, kind: NfoKind, mutate: Mutator, seed: Optional[NfoSeed] = None) -> NfoUpdateResult:
+@dataclass
+class NfoOwner:
+    """The library item an NFO write is for, so the NFOs the application creates are recorded
+    as its own (see :mod:`..storage.nfo_files`)."""
+
+    repo: NfoFileRepository
+    key: ItemKey
+
+    def before_write(self, path: str) -> None:
+        """A managed NFO whose content changed since the application's last write was edited by
+        someone else: from now on it is theirs, even after the application writes to it again."""
+        record = self.repo.get(path)
+        if record is None or record.status != MANAGED:
+            return
+        current = file_sha256(path)
+        if current is not None and current != record.file_hash:
+            self.repo.mark_modified(path)
+            log.info("NFO changed outside the application, it will never be deleted: %s", path)
+
+    def after_write(self, path: str, kind: NfoKind, created: bool) -> None:
+        digest = file_sha256(path)
+        if digest is None:
+            return
+        if created:
+            self.repo.register(path, kind.value, self.key, digest)
+        else:
+            self.repo.set_hash(path, digest)  # only touches managed (unmodified) records
+
+
+def update_nfo(path: str, kind: NfoKind, mutate: Mutator, seed: Optional[NfoSeed] = None,
+               owner: Optional[NfoOwner] = None) -> NfoUpdateResult:
     """Load (or create) the NFO at ``path``, apply ``mutate`` and save if anything changed.
 
     Raises :class:`~xtreamscraper.nfo.document.NfoParseError` for an existing file that is
-    not valid NFO XML: such a file is never overwritten.
+    not valid NFO XML: such a file is never overwritten. With an ``owner``, an NFO this call
+    creates is recorded as the application's, and later writes keep its recorded hash current.
     """
     with _lock_for(path):
+        if owner is not None:
+            owner.before_write(path)
         doc = NfoDocument.load_or_create(path, kind)
         created = not doc.existed
         if created and seed is not None:
@@ -75,4 +110,6 @@ def update_nfo(path: str, kind: NfoKind, mutate: Mutator, seed: Optional[NfoSeed
             raise
         if written:
             log.debug("NFO %s: %s", "created" if created else "updated", path)
+            if owner is not None:
+                owner.after_write(path, kind, created)
         return NfoUpdateResult(path=path, created=created, written=written)

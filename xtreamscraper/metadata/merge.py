@@ -7,6 +7,8 @@
 * In both modes a missing, empty or invalid plugin value never erases anything.
 * External IDs and ratings are keyed by source: a plugin only ever adds or (with
   overwrite) updates its own keys; other sources' IDs/ratings are untouched.
+* IDs the user entered by hand (``locked_ids``) are never changed by any plugin, whatever
+  its overwrite setting.
 * Artwork is not merged here: candidates are selected per slot by
   :mod:`.artwork_selection` and stored by the core artwork manager.
 """
@@ -16,7 +18,7 @@ from __future__ import annotations
 import copy
 import unicodedata
 from dataclasses import fields
-from typing import Any, Callable, Iterable, Optional
+from typing import AbstractSet, Any, Callable, Iterable, Optional
 
 from .models import (
     LIST_FIELDS,
@@ -109,8 +111,13 @@ def dedupe(items: Iterable[Any], key_fn: Callable[[Any], list[Any]], seen: Optio
 
 
 # -- merge -----------------------------------------------------------------------------------------
-def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool) -> set[str]:
-    """Merge ``src`` (one plugin's result) into ``dest`` in place. Returns changed field names."""
+def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool,
+               locked_ids: AbstractSet[str] = frozenset()) -> set[str]:
+    """Merge ``src`` (one plugin's result) into ``dest`` in place. Returns changed field names.
+
+    ``locked_ids``: external-ID namespaces whose value the user set by hand; ``src`` never
+    changes them.
+    """
     changed: set[str] = set()
 
     for name in SCALAR_FIELDS + ("show_title", "season_number", "episode_number"):
@@ -141,7 +148,7 @@ def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool) -> se
 
     for id_type, value in src.external_ids.items():
         key, value = (id_type or "").strip().lower(), (str(value).strip() if value is not None else "")
-        if not key or not value:
+        if not key or not value or key in locked_ids:
             continue
         if key not in dest.external_ids or (overwrite and dest.external_ids[key] != value):
             dest.external_ids[key] = value

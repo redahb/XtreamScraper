@@ -36,7 +36,7 @@ from ..metadata.plugin import ArtworkPayload
 from ..nfo.artwork_refs import RefLocation, add_ref, find_urls, remove_ref
 from ..nfo.document import NfoDocument, NfoError
 from ..nfo.paths import NfoKind
-from ..nfo.service import NfoSeed, update_nfo
+from ..nfo.service import NfoOwner, NfoSeed, update_nfo
 from ..storage.artwork import (
     DISABLED,
     ERROR,
@@ -48,9 +48,11 @@ from ..storage.artwork import (
     OK,
     ArtworkRepository,
     FileRecord,
+    ItemKey,
     SlotRecord,
 )
 from ..storage.db import Database
+from ..storage.nfo_files import NfoFileRepository
 from ..utils.redact import redact
 from .download import ArtworkDownloader, ArtworkDownloadError, detect_format, validate_image
 from .naming import (
@@ -129,6 +131,7 @@ class NfoEdit:
     seed_title: Optional[str] = None
     adds: list[tuple[RefLocation, str, int, Optional[str]]] = field(default_factory=list)  # loc, url, slot, plugin
     removes: list[tuple[RefLocation, str, int]] = field(default_factory=list)  # loc, url, ref id
+    owner_key: Optional[ItemKey] = None  # the item an NFO this edit creates belongs to
 
     @property
     def changes(self) -> bool:
@@ -169,11 +172,20 @@ class ItemPlan:
         edit = self.edits.get(nfo_path)
         return edit if edit and edit.changes else None
 
+    def _owner_of(self, nfo_path: str) -> Optional[ItemKey]:
+        target = self.target
+        if nfo_path == target.nfo_path:
+            return target.key
+        if nfo_path == target.parent_nfo_path and target.item_kind == SEASON:  # a season's tvshow.nfo
+            provider_id, _, category_id, item_id = target.key
+            return (provider_id, SERIES, category_id, item_id.split("/", 1)[0])
+        return None
+
     def _edit(self, nfo_path: str, kind: NfoKind) -> NfoEdit:
         edit = self.edits.get(nfo_path)
         if edit is None:
             seed = self.target.title if nfo_path == self.target.nfo_path else None
-            edit = self.edits[nfo_path] = NfoEdit(nfo_path, kind, seed)
+            edit = self.edits[nfo_path] = NfoEdit(nfo_path, kind, seed, owner_key=self._owner_of(nfo_path))
         return edit
 
 
@@ -182,6 +194,7 @@ class ArtworkManager:
                  downloader: Optional[ArtworkDownloader] = None, stats: Optional[ArtworkStats] = None,
                  private_fetch: Optional[PrivateFetch] = None) -> None:
         self.repo = ArtworkRepository(db)
+        self.nfo_files = NfoFileRepository(db)
         #: ``(plugin_id, download_ref) -> ArtworkPayload | None``: authenticated downloads a
         #: plugin session offers for local mode (see ``Artwork.download_ref``).
         self.private_fetch = private_fetch
@@ -230,11 +243,13 @@ class ArtworkManager:
         self.complete(self.prepare(target, selections, force))
 
     def prepare(self, target: ArtworkTarget, selections: Optional[dict[Slot, Artwork]] = None,
-                force: bool = False) -> ItemPlan:
+                force: bool = False, retire: frozenset[ArtworkType] = frozenset()) -> ItemPlan:
         """Persist new selections and bring every slot of ``target`` in line with the mode.
 
         Local files are downloaded and written here (before any NFO reference is removed);
-        NFO edits and deletions are planned for :meth:`complete`.
+        NFO edits and deletions are planned for :meth:`complete`. ``retire``: artwork types
+        whose stored selection is known to be wrong (it came from a replaced match) and has
+        no new winner; their owned files and NFO references are removed.
         """
         plan = ItemPlan(target)
         allowed = TYPES_BY_KIND.get(target.item_kind, ())
@@ -245,9 +260,13 @@ class ArtworkManager:
                              art.language, art.width, art.height)
             if art.download_ref and art.source_plugin:
                 plan.private[art_type.value] = (art.source_plugin, art.url.strip(), art.download_ref)
+        selected = {art_type for art_type, _ in (selections or {})}
         for slot in self.repo.slots(target.key):
             self.stats.considered += 1
             try:
+                if ArtworkType(slot.artwork_type) in retire - selected and self.mode in (LOCAL, REMOTE):
+                    self._retire(plan, slot)
+                    continue
                 self._plan_slot(plan, slot, force)
             except Exception as exc:  # one failing slot never stops the item or the job
                 self._fail(slot, f"{target.label} {slot.artwork_type}: {exc}")
@@ -290,7 +309,8 @@ class ArtworkManager:
     def _write(self, edit: NfoEdit) -> bool:
         seed = NfoSeed(title=edit.seed_title) if edit.seed_title else None
         try:
-            update_nfo(edit.nfo_path, edit.nfo_kind, edit.apply, seed)
+            owner = NfoOwner(self.nfo_files, edit.owner_key) if edit.owner_key else None
+            update_nfo(edit.nfo_path, edit.nfo_kind, edit.apply, seed, owner)
         except (NfoError, OSError) as exc:
             log.warning("Artwork NFO update failed for %s: %s", edit.nfo_path, exc)
             return False
@@ -326,6 +346,32 @@ class ArtworkManager:
             self._plan_local(plan, slot, art_type, force)
         else:
             self._plan_remote(plan, slot, art_type)
+
+    def _retire(self, plan: ItemPlan, slot: SlotRecord) -> None:
+        """Remove a wrong selection: owned NFO references first, then (once those NFOs are
+        written and verified) owned files, then the slot. User artwork is never touched."""
+        target = plan.target
+        art_type = ArtworkType(slot.artwork_type)
+        requires = []
+        for ref in self.repo.refs(slot.id):
+            plan._edit(ref.nfo_path, NfoKind(ref.nfo_kind)).removes.append(
+                (RefLocation.from_key(ref.location), ref.url, ref.id))
+            requires.append(ref.nfo_path)
+
+        def run() -> None:
+            for record in self._refresh_files(target, slot, art_type):
+                if record.status == MANAGED:
+                    self._delete_managed(target, art_type, record)
+            if self.repo.files(slot.id) or self.repo.refs(slot.id):
+                self.repo.set_status(slot.id, MODIFIED, "artwork from a replaced match was changed outside the "
+                                                        "application; kept", keep_mode=True)
+            else:
+                self.repo.delete_slot(slot.id)
+
+        def blocked() -> None:
+            self._fail(slot, f"{target.label}: {art_type.value} NFO reference could not be removed; artwork kept")
+
+        plan.post.append(PostAction(tuple(requires), run, blocked))
 
     # -- local mode -----------------------------------------------------------------------------------
     def _refresh_files(self, target: ArtworkTarget, slot: SlotRecord, art_type: ArtworkType) -> list[FileRecord]:
@@ -552,6 +598,42 @@ class ArtworkManager:
                              "local artwork kept")
 
         plan.post.append(PostAction(tuple(requires), run, blocked))
+
+    # -- permanent purge of a missing item ------------------------------------------------------------
+    def purge(self, target: ArtworkTarget) -> bool:
+        """Delete the item's application-owned local artwork (the item is being purged).
+
+        Exactly the checks of a normal replacement apply: a file is deleted only when its
+        ownership record, path and hash prove it is the application's. Everything else (user
+        artwork, files changed outside the application) is kept. Returns False when an owned
+        file could not be deleted, so the caller keeps the item's state and retries later.
+        """
+        ok = True
+        for slot in self.repo.slots(target.key):
+            try:
+                art_type = ArtworkType(slot.artwork_type)
+            except ValueError:
+                continue
+            for record in self._refresh_files(target, slot, art_type):  # follows moves, flags edits
+                if record.status != MANAGED:
+                    continue
+                path = record.local_path
+                reason = self._unsafe(target, art_type, record)
+                if reason:
+                    self.stats.warn(f"{target.label}: not deleting {os.path.basename(path)}: {reason}")
+                    continue
+                try:
+                    os.remove(atomic.fs_path(path))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    self.stats.error(f"{target.label}: artwork {os.path.basename(path)} could not be deleted: {exc}")
+                    ok = False
+                    continue
+                self.repo.forget_file(record.id)
+                self.stats.local_removed += 1
+                log.debug("Purged managed artwork %s", path)
+        return ok
 
     # -- safe deletion --------------------------------------------------------------------------------
     def _delete_managed(self, target: ArtworkTarget, art_type: ArtworkType, record: FileRecord) -> bool:
