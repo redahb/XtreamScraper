@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar, Union
 
 from xtreamscraper.artwork.download import ArtworkDownloadError, validate_image
 from xtreamscraper.core.matching import MatchCandidate, TitleMatcher, normalize_title
-from xtreamscraper.core.matching.models import Decision
+from xtreamscraper.core.matching.models import Decision, MatchDecision
 from xtreamscraper.utils.timeutil import now_iso
 from xtreamscraper.metadata.models import MediaType
 from xtreamscraper.metadata.plugin import (
@@ -81,6 +81,9 @@ MAIN_API, POSTER_API, LAST_SUCCESS, LAST_JOB = ("Main API", "Poster API", "Last 
                                                 "OMDb requests in the last job")
 
 ClientFactory = Callable[[dict[str, Any]], OMDbClient]
+# A per-job cache entry: the JSON answer, or the definitive "not found" (re-raised on a hit).
+CacheEntry = Union[dict[str, Any], OMDbNotFound]
+_Key = TypeVar("_Key")
 
 
 def _default_client(config: dict[str, Any]) -> OMDbClient:
@@ -93,6 +96,16 @@ class OMDbSuspended(OMDbError):
 
 
 class OMDbSession(ScraperSession):
+    """One scrape job's OMDb access: per-job caches, job-wide suspension, settings-page status.
+
+    Contract:
+        Preconditions:
+            - ``config`` holds validated values (``OMDbPlugin.validate_config``): a non-numeric
+              ``threshold`` or ``poster_height`` raises ``ValueError``/``TypeError`` in ``__init__``
+              (implicit, from ``float()``/``int()``); ``poster_height`` is clamped to 1-3000.
+            - The caches and the status fields are not locked.
+    """
+
     def __init__(self, client: OMDbClient, config: dict[str, Any], matcher: TitleMatcher) -> None:
         self.client = client
         self.matcher = matcher
@@ -101,10 +114,10 @@ class OMDbSession(ScraperSession):
         self.poster_height = min(MAX_POSTER_HEIGHT, max(1, int(config.get("poster_height") or 1080)))
         self.suspended = None
         # Per-job caches: one request per exact resource (not-found answers are cached too).
-        self._search_cache: dict[tuple, Any] = {}
-        self._detail_cache: dict[str, Any] = {}
-        self._episode_cache: dict[tuple, Any] = {}
-        self._season_cache: dict[tuple, Any] = {}
+        self._search_cache: dict[tuple[str, Optional[int], str, int], CacheEntry] = {}  # title key, year, type, page
+        self._detail_cache: dict[str, CacheEntry] = {}  # IMDb ID
+        self._episode_cache: dict[tuple[str, int, int], CacheEntry] = {}  # series IMDb ID, season, episode
+        self._season_cache: dict[tuple[str, int], CacheEntry] = {}  # series IMDb ID, season
         self.main_api: Optional[str] = None
         self.poster_api: Optional[str] = None  # "available" / "unavailable for this key" (this job)
         self.last_success: Optional[str] = None
@@ -119,7 +132,22 @@ class OMDbSession(ScraperSession):
         self.suspended = message
         self.main_api = main_status
 
-    def _cached(self, cache: dict, key: Any, call: Callable[[], Any]) -> Any:
+    def _cached(self, cache: dict[_Key, CacheEntry], key: _Key, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """``call()`` at most once per ``key`` for this job (metadata API only).
+
+        Contract:
+            Raises:
+                OMDbNotFound: Fresh or cached (the same instance is re-raised on every hit);
+                    also counts as a successful request for the status.
+                OMDbSuspended: On a cache miss once the session is suspended; nothing is requested.
+                OMDbQuotaError, OMDbAuthError: After suspending the session for the job (the
+                    warning is logged once).
+                OMDbError: Any other client error, not cached (a later call retries).
+
+            Silences:
+                - Cache hits are served even while suspended. Cached answers are returned by
+                  reference: a caller that mutates one changes the cache.
+        """
         if key in cache:
             value = cache[key]
             if isinstance(value, OMDbNotFound):
@@ -147,17 +175,19 @@ class OMDbSession(ScraperSession):
         self.main_api = "available"
         self.last_success = now_iso()
 
-    def _details(self, remote_id: str) -> dict:
+    def _details(self, remote_id: str) -> dict[str, Any]:
         return self._cached(self._detail_cache, remote_id, lambda: self.client.get_by_id(remote_id))
 
-    def _search(self, title: str, media_type: str, year: Optional[int], page: int) -> dict:
+    def _search(self, title: str, media_type: str, year: Optional[int], page: int) -> dict[str, Any]:
+        """A cached ``s=`` page. The cache key uses ``normalize_title(title)`` while the request
+        sends the raw title, so titles that normalize alike share the first one's answer."""
         key = (normalize_title(title), year, media_type, page)
         return self._cached(self._search_cache, key, lambda: self.client.search(title, media_type, year, page))
 
     # -- matching ---------------------------------------------------------------------------------------
     @staticmethod
-    def _candidates(results: list, media_type: str) -> list[MatchCandidate]:
-        candidates = []
+    def _candidates(results: list[Any], media_type: str) -> list[MatchCandidate]:
+        candidates: list[MatchCandidate] = []
         for r in results:
             if not isinstance(r, dict) or media_type_of(r) != media_type:
                 continue  # only the requested type is a candidate
@@ -168,16 +198,33 @@ class OMDbSession(ScraperSession):
         return candidates
 
     def _match(self, query: MatchQuery, media_type: str) -> MatchOutcome:
+        """Search (with the year first, then without) and decide with the shared matcher.
+
+        Candidates accumulate over pages and both year passes; the first matched or ambiguous
+        decision is returned at once.
+
+        Contract:
+            Silences:
+                - :class:`OMDbMalformed` and a successful answer without a ``Search`` list become
+                  ``provider_format_error``; every other :class:`OMDbError` (quota, key, transport,
+                  suspension) becomes ``MatchOutcome.error``. Nothing is raised.
+                - A search that OMDb answers with "not found" or "too many results" counts as
+                  no results (``unmatched``), not as an error.
+                - Results of another ``Type``, without a valid IMDb ID or without a title are
+                  dropped before matching.
+        """
         method = MatchMethod.TITLE_YEAR if query.year else MatchMethod.TITLE_ONLY
         candidates: list[MatchCandidate] = []
-        decision = None
+        decision: Optional[MatchDecision] = None
         try:
             # With a known year first (remakes share titles), then once without it. Pages are only
             # fetched while nothing acceptable was found, and never more than MAX_SEARCH_PAGES.
             for year in ([query.year, None] if query.year else [None]):
                 for page in range(1, MAX_SEARCH_PAGES + 1):
                     data = self._search(query.title, media_type, year, page)
-                    results = data.get("Search") if isinstance(data.get("Search"), list) else []
+                    results = data.get("Search")
+                    if not isinstance(results, list):  # a successful answer without a result list
+                        return MatchOutcome.provider_format_error("OMDb returned an unexpected search response")
                     candidates += self._candidates(results, media_type)
                     if candidates:
                         decision = self.matcher.decide(query.title, query.year, candidates, self.threshold)
@@ -186,6 +233,8 @@ class OMDbSession(ScraperSession):
                     total = parse_int(data.get("totalResults")) or 0
                     if not results or page * PAGE_SIZE >= total:
                         break
+        except OMDbMalformed as exc:
+            return MatchOutcome.provider_format_error(str(exc))
         except OMDbError as exc:
             return MatchOutcome.error(str(exc))
         if decision is None:
@@ -193,6 +242,17 @@ class OMDbSession(ScraperSession):
         return MatchOutcome.from_decision(decision, method)
 
     def _fetch(self, remote_id: str, media_type: str, media: MediaType) -> FetchOutcome:
+        """Details for an IMDb ID; ``media_type`` is OMDb's ``type`` string for ``media``.
+
+        Contract:
+            Silences:
+                - Never raises for OMDb answers: not found -> ``not_found``; malformed ->
+                  ``provider_format_error``; other errors (quota, key, transport, suspended) ->
+                  ``error``, which keeps the binding.
+                - ``not_found`` also for a ``remote_id`` that is not an IMDb ID, a record of
+                  another known ``Type`` or a different returned ``imdbID`` (a known other title).
+                  A record without ``Type`` or ``imdbID`` is accepted.
+        """
         requested = imdb_id(remote_id)
         if not requested:
             return FetchOutcome.not_found(f"{remote_id!r} is not an IMDb ID")
@@ -200,6 +260,8 @@ class OMDbSession(ScraperSession):
             data = self._details(requested)
         except OMDbNotFound:
             return FetchOutcome.not_found("not found at OMDb")
+        except OMDbMalformed as exc:
+            return FetchOutcome.provider_format_error(str(exc))
         except OMDbError as exc:
             return FetchOutcome.error(str(exc))
         kind = media_type_of(data)
@@ -228,7 +290,18 @@ class OMDbSession(ScraperSession):
     # get_season: OMDb has no standalone season metadata -> the default "unsupported".
 
     def get_episode(self, series_remote_id: str, season_number: int, episode_number: int) -> FetchOutcome:
-        """Series IMDb ID + local season/episode numbers (authoritative); never a title search."""
+        """Series IMDb ID + local season/episode numbers (authoritative); never a title search.
+
+        Contract:
+            Preconditions:
+                - ``season_number`` / ``episode_number`` must be ``int()``-convertible
+                  (``ValueError``/``TypeError`` otherwise, implicit and not caught).
+
+            Silences:
+                - As :meth:`_fetch`: errors become outcomes. ``not_found`` also when OMDb answers
+                  another ``Type``, another season/episode/series (when it states them), or no
+                  episode IMDb ID of its own.
+        """
         series = imdb_id(series_remote_id)
         if not series:
             return FetchOutcome.not_found(f"{series_remote_id!r} is not an IMDb ID")
@@ -238,6 +311,8 @@ class OMDbSession(ScraperSession):
                                 lambda: self.client.get_episode(series, season_number, episode_number))
         except OMDbNotFound:
             return FetchOutcome.not_found("episode not found at OMDb")
+        except OMDbMalformed as exc:
+            return FetchOutcome.provider_format_error(str(exc))
         except OMDbError as exc:
             return FetchOutcome.error(str(exc))
         kind = media_type_of(data)
@@ -257,7 +332,14 @@ class OMDbSession(ScraperSession):
         return FetchOutcome.ok(meta, remote)
 
     def season_listing(self, series_remote_id: str, season_number: int) -> Optional[SeasonListing]:
-        """The episodes OMDb knows for a season (informational; possibly incomplete)."""
+        """The episodes OMDb knows for a season (informational; possibly incomplete).
+
+        Contract:
+            Silences:
+                - Every :class:`OMDbError` (not found, quota, key, transport, malformed) returns
+                  ``None``, as does a ``series_remote_id`` that is not an IMDb ID; the caller cannot
+                  tell them apart. Quota and key errors still suspend the session.
+        """
         series = imdb_id(series_remote_id)
         if not series:
             return None
@@ -270,7 +352,18 @@ class OMDbSession(ScraperSession):
 
     # -- high-resolution posters -----------------------------------------------------------------------
     def fetch_artwork(self, download_ref: str) -> Optional[ArtworkPayload]:
-        """Poster API image for a local download. The key-bearing URL never leaves the client."""
+        """Poster API image for a local download. The key-bearing URL never leaves the client.
+
+        Contract:
+            Silences:
+                - Returns ``None`` (the core then downloads the public poster) when the Poster API
+                  is off, the session is suspended, ``download_ref`` is not an IMDb ID, or on any
+                  :class:`OMDbError`. A key/entitlement rejection marks the Poster API
+                  "unavailable for this key" for the rest of the job without suspending the
+                  metadata API; a quota answer suspends the session; other failures are logged at
+                  INFO with the IMDb ID only.
+                - The image bytes are not validated here.
+        """
         ref = imdb_id(download_ref)
         if not ref or not self.use_poster_api or self.suspended or self.poster_api == "unavailable for this key":
             return None
@@ -306,7 +399,7 @@ class OMDbSession(ScraperSession):
 class OMDbPlugin(ScraperPlugin):
     plugin_id = "omdb"
     display_name = "OMDb"
-    version = "20261002"
+    version = "20261004"
     capabilities = frozenset({
         Capability.MOVIES, Capability.SERIES, Capability.EPISODES,
         Capability.ARTWORK, Capability.RATINGS, Capability.EXTERNAL_IDS,
@@ -341,6 +434,13 @@ class OMDbPlugin(ScraperPlugin):
                               placeholder="tt0133093", pattern_hint="tt + digits")]
 
     def normalize_manual_id(self, namespace: str, value: str) -> str:
+        """An IMDb ID (``tt`` + at least 5 digits, lower-cased) from an ID or an IMDb title link.
+
+        Contract:
+            Raises:
+                ManualIdError: For a namespace other than ``imdb``, or a value that holds no
+                    IMDb ID (explicit).
+        """
         if namespace != "imdb":
             raise ManualIdError("OMDb only accepts IMDb IDs")
         text = (value or "").strip()
@@ -351,6 +451,13 @@ class OMDbPlugin(ScraperPlugin):
         return found
 
     def validate_config(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Schema validation plus defaults (threshold 85, height 1080, OMDb base URLs).
+
+        Contract:
+            Raises:
+                ConfigError: From the schema check, or for a base URL that is not ``https://``,
+                    contains whitespace, ``?`` or ``#`` (explicit). A blank URL is the default.
+        """
         clean = validate_against_schema(self.config_schema(), values)
         if clean.get("threshold") is None:
             clean["threshold"] = 85
@@ -374,7 +481,15 @@ class OMDbPlugin(ScraperPlugin):
             return None
 
     def test_connection(self, config: dict[str, Any]) -> TestResult:
-        """A lightweight authenticated lookup of one well-known title."""
+        """A lightweight authenticated lookup of one well-known title.
+
+        Contract:
+            Silences:
+                - Never raises for OMDb answers: each failure becomes ``(False, message, status)``;
+                  "not found" for the test title still proves the key and counts as success. A
+                  transport failure reads "OMDb API unreachable"; other errors show their own
+                  (key-free) message. The client is always closed.
+        """
         client = self._client(config) if self.is_configured(config) else None
         if client is None:
             return False, "OMDb API key missing", {MAIN_API: "API key missing"}
@@ -401,6 +516,18 @@ class OMDbPlugin(ScraperPlugin):
         return [TestAction("poster", "Test Poster API")]
 
     def run_test(self, key: str, config: dict[str, Any]) -> TestResult:
+        """The "Test Poster API" action: one Poster API request for the test title.
+
+        Contract:
+            Raises:
+                KeyError: For any ``key`` other than ``"poster"`` (explicit).
+
+            Silences:
+                - Every OMDb or image-validation failure becomes ``(False, message, status)``.
+                  When the Poster API rejects the key, one metadata request tells "Invalid API
+                  key" (metadata API rejects it too) from "unavailable for this key" (it accepts
+                  it); a quota or other failure of that check is reported as such.
+        """
         if key != "poster":
             raise KeyError(key)
         client = self._client(config) if self.is_configured(config) else None
@@ -419,8 +546,12 @@ class OMDbPlugin(ScraperPlugin):
                 client.request({"i": TEST_TITLE})
             except OMDbNotFound:
                 pass
-            except OMDbError:
+            except OMDbAuthError:
                 return False, "Invalid API key", {POSTER_API: "API key invalid"}
+            except OMDbQuotaError:
+                return False, "OMDb request limit reached", {MAIN_API: "Request quota exhausted"}
+            except OMDbError:  # the key could not be checked (network, server or format problem)
+                return False, "Poster request failed", {POSTER_API: "request failed"}
             return False, "Poster API unavailable for this key", {POSTER_API: "unavailable for this key"}
         except OMDbQuotaError:
             return False, "OMDb request limit reached", {MAIN_API: "Request quota exhausted"}
@@ -431,4 +562,11 @@ class OMDbPlugin(ScraperPlugin):
         return True, "Poster API available", {POSTER_API: "available"}
 
     def create_session(self, config: dict[str, Any]) -> ScraperSession:
+        """A new :class:`OMDbSession` for one job.
+
+        Contract:
+            Raises:
+                OMDbAuthError: From the default client factory when ``api_key`` is blank (not
+                    caught here; the engine reports a raising ``create_session`` and skips the plugin).
+        """
         return OMDbSession(self.client_factory(config), config, TitleMatcher(self.scoring_profile))

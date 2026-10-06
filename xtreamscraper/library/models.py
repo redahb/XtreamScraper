@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Final, Optional
 
 from ..nfo.paths import NfoKind, episode_nfo_path, movie_nfo_path, season_nfo_path, tvshow_nfo_path
 
-MOVIE = "movie"
-EPISODE = "episode"
+MOVIE: Final = "movie"
+EPISODE: Final = "episode"
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,8 @@ class LibraryItem:
     series_folder: Optional[str] = None
     season: Optional[int] = None
     episode: Optional[int] = None
+    # Fingerprint of the stream URL the last sync wrote (sync state); not part of identity.
+    url_hash: Optional[str] = field(default=None, compare=False)
 
     @property
     def folder(self) -> str:

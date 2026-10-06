@@ -25,6 +25,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
@@ -63,6 +66,7 @@ from .naming import (
     SERIES,
     TYPES_BY_KIND,
     ArtworkTarget,
+    DirectoryListings,
     LocalName,
     all_local_names,
     enabled_types,
@@ -75,6 +79,14 @@ log = logging.getLogger(__name__)
 MAX_MESSAGES = 500
 LOCAL, REMOTE = "local", "remote"
 PrivateFetch = Callable[[str, str], Optional[ArtworkPayload]]
+#: ``(source plugin, public URL, download_ref)`` of a selection offering an authenticated download.
+PrivateDownload = tuple[str, str, str]
+#: A planned NFO reference: ``(location, url, slot id, source plugin)``.
+RefAdd = tuple[RefLocation, str, int, Optional[str]]
+#: A planned NFO reference removal: ``(location, url, ref id)``.
+RefRemove = tuple[RefLocation, str, int]
+#: An obtained image: ``(bytes, format, source URL)``.
+ObtainedImage = tuple[bytes, str, str]
 
 
 def file_hash(path: str) -> Optional[str]:
@@ -84,12 +96,83 @@ def file_hash(path: str) -> Optional[str]:
         return None
 
 
+class FileHashCache:
+    """SHA-256 of files keyed by path and ``(size, mtime_ns, inode)``, so an unchanged file is
+    not read again.
+
+    The database records only the hash (and size), so this lives in memory. A file whose
+    modification time is too recent to tell a later same-size edit apart (coarse file system
+    clocks) is hashed but not cached. Any change of size, time or inode means a new hash.
+    """
+
+    #: Files modified less than this many seconds before hashing are not cached.
+    RACY_SECONDS = 2.0
+
+    def __init__(self, max_entries: int = 50_000, clock: Callable[[], float] = time.time) -> None:
+        self.max_entries = max_entries
+        self.clock = clock
+        self._entries: OrderedDict[str, tuple[tuple[int, int, int], str]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _signature(path: str) -> Optional[tuple[int, int, int]]:
+        try:
+            info = os.stat(atomic.fs_path(path))
+        except OSError:
+            return None
+        return info.st_size, info.st_mtime_ns, info.st_ino
+
+    def hash(self, path: str) -> Optional[str]:
+        """SHA-256 of ``path``, from the cache while its size, mtime and inode are unchanged.
+
+        Contract:
+            Silences:
+                - A missing or unreadable file gives ``None`` (``OSError`` from ``stat`` or the
+                  read), the same as :func:`file_hash`.
+                - An edit that keeps size, mtime and inode (an mtime set back on purpose)
+                  returns the old cached hash. Files modified less than ``RACY_SECONDS``
+                  before hashing are never cached, so a coarse clock cannot cause this.
+        """
+        key = os.path.normcase(os.path.abspath(path))
+        before = self._signature(path)
+        if before is None:
+            return None
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is not None and hit[0] == before:
+                self._entries.move_to_end(key)
+                return hit[1]
+        digest = file_hash(path)
+        if digest is None or self._signature(path) != before:
+            return digest  # changed while reading: never cache
+        if self.clock() - before[1] / 1e9 > self.RACY_SECONDS:
+            with self._lock:
+                self._entries[key] = (before, digest)
+                self._entries.move_to_end(key)
+                while len(self._entries) > self.max_entries:
+                    self._entries.popitem(last=False)
+        return digest
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+#: Shared by every manager of this process; entries are only valid for unchanged files.
+shared_hash_cache = FileHashCache()
+
+
 def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def _base(path: str) -> str:
     return os.path.splitext(path)[0]
+
+
+def _records_at(records: list[FileRecord], base: str) -> list[FileRecord]:
+    """The recorded files named ``base`` (any extension)."""
+    return [r for r in records if _same_path(_base(r.local_path), base)]
 
 
 @dataclass
@@ -129,8 +212,8 @@ class NfoEdit:
     nfo_path: str
     nfo_kind: NfoKind
     seed_title: Optional[str] = None
-    adds: list[tuple[RefLocation, str, int, Optional[str]]] = field(default_factory=list)  # loc, url, slot, plugin
-    removes: list[tuple[RefLocation, str, int]] = field(default_factory=list)  # loc, url, ref id
+    adds: list[RefAdd] = field(default_factory=list)  # loc, url, slot, plugin
+    removes: list[RefRemove] = field(default_factory=list)  # loc, url, ref id
     owner_key: Optional[ItemKey] = None  # the item an NFO this edit creates belongs to
 
     @property
@@ -144,6 +227,11 @@ class NfoEdit:
             add_ref(doc, loc, url)
 
     def verify(self, doc: NfoDocument) -> bool:
+        """Whether ``doc`` holds every added reference and none of the removed ones.
+
+        A reference that is removed and added again (same location and URL) only has to be
+        present.
+        """
         added = all(url in find_urls(doc, loc) for loc, url, _, _ in self.adds)
         removed = all(url not in find_urls(doc, loc) for loc, url, _ in self.removes
                       if not any(a[0] == loc and a[1] == url for a in self.adds))
@@ -166,13 +254,25 @@ class ItemPlan:
     post: list[PostAction] = field(default_factory=list)
     #: artwork type -> (source plugin, public URL, download_ref) of this run's selections that
     #: offer an authenticated download. Kept in memory only; never persisted.
-    private: dict[str, tuple[str, str, str]] = field(default_factory=dict)
+    private: dict[str, PrivateDownload] = field(default_factory=dict)
 
     def edit_for(self, nfo_path: str) -> Optional[NfoEdit]:
+        """The planned edit with changes for ``nfo_path`` (exact path string), else ``None``."""
         edit = self.edits.get(nfo_path)
         return edit if edit and edit.changes else None
 
     def _owner_of(self, nfo_path: str) -> Optional[ItemKey]:
+        """The item an NFO this plan creates at ``nfo_path`` belongs to, or ``None``.
+
+        Contract:
+            Preconditions:
+                - Paths are compared as exact strings, so ``nfo_path`` must be spelled as the
+                  target built it (``nfo_path`` / ``parent_nfo_path``); another spelling of
+                  the same file gives ``None`` and a created NFO is then not recorded as owned.
+                - A season's item ID is ``"<series_id>/<season>"``
+                  (:meth:`ArtworkTarget.for_season`); the series ID is the part before the
+                  first ``/``, so a series ID containing ``/`` silently gives a wrong key.
+        """
         target = self.target
         if nfo_path == target.nfo_path:
             return target.key
@@ -190,10 +290,20 @@ class ItemPlan:
 
 
 class ArtworkManager:
+    """Applies the artwork mode to library items, one item at a time (see the module docstring).
+
+    Not thread-safe: :meth:`prepare` keeps its directory listings on the instance and the
+    stats counters are plain integers. Use one manager per worker.
+    """
+
     def __init__(self, db: Database, settings: Settings, library_root: str,
                  downloader: Optional[ArtworkDownloader] = None, stats: Optional[ArtworkStats] = None,
-                 private_fetch: Optional[PrivateFetch] = None) -> None:
+                 private_fetch: Optional[PrivateFetch] = None,
+                 hash_cache: Optional[FileHashCache] = None) -> None:
         self.repo = ArtworkRepository(db)
+        self.hashes = hash_cache if hash_cache is not None else shared_hash_cache
+        #: directory listings, only while :meth:`prepare` runs
+        self._listings: Optional[DirectoryListings] = None
         self.nfo_files = NfoFileRepository(db)
         #: ``(plugin_id, download_ref) -> ArtworkPayload | None``: authenticated downloads a
         #: plugin session offers for local mode (see ``Artwork.download_ref``).
@@ -250,7 +360,34 @@ class ArtworkManager:
         NFO edits and deletions are planned for :meth:`complete`. ``retire``: artwork types
         whose stored selection is known to be wrong (it came from a replaced match) and has
         no new winner; their owned files and NFO references are removed.
+
+        Contract:
+            Preconditions:
+                - Not re-entrant: the directory listing cache lives on ``self`` for the call.
+                - ``force`` overwrites managed files changed outside the application and
+                  replaces managed files whose URL changed even with "Keep existing"; the
+                  engine passes it for the rebuild after a manual match.
+
+            Raises:
+                sqlite3.Error: From storing the selections or listing the slots (before the
+                    per-slot handling), not caught.
+
+            Silences:
+                - Selections for an artwork type the item kind does not have, or with an
+                  empty URL, are dropped without notice.
+                - Any ``Exception`` while handling one slot (a write or verification
+                  failure, a database error, or a programming error) becomes that slot's ``ERROR`` status and a
+                  ``stats.errors`` entry, logged with traceback; the other slots go on.
+                - ``retire`` is ignored in disabled mode: the stale selection stays stored.
         """
+        self._listings = DirectoryListings()
+        try:
+            return self._prepare(target, selections, force, retire)
+        finally:
+            self._listings = None
+
+    def _prepare(self, target: ArtworkTarget, selections: Optional[dict[Slot, Artwork]], force: bool,
+                 retire: frozenset[ArtworkType]) -> ItemPlan:
         plan = ItemPlan(target)
         allowed = TYPES_BY_KIND.get(target.item_kind, ())
         for (art_type, _season), art in (selections or {}).items():
@@ -278,6 +415,22 @@ class ArtworkManager:
 
         ``written`` maps NFO paths the caller already saved (with the plan's edits applied)
         to whether that write succeeded.
+
+        Contract:
+            Preconditions:
+                - ``plan`` comes from :meth:`prepare` and is completed once.
+                - ``written`` keys must be the exact path strings of ``plan.edits``; a key
+                  spelled differently is not found and the edit is written again here.
+
+            Raises:
+                sqlite3.Error: From recording the written references, not caught.
+
+            Silences:
+                - An NFO edit that fails to write or verify: a ``stats.errors`` entry, no
+                  reference records change, and every post action that needs that NFO runs
+                  its ``blocked`` handler instead (the previous artwork stays).
+                - Any ``Exception`` from a post action: a ``stats.errors`` entry, logged with
+                  traceback; the remaining post actions still run.
         """
         written = written or {}
         ok: dict[str, bool] = {}
@@ -307,9 +460,20 @@ class ArtworkManager:
 
     # -- NFO edits ------------------------------------------------------------------------------------
     def _write(self, edit: NfoEdit) -> bool:
+        """Write ``edit`` through :func:`update_nfo` and verify it.
+
+        Contract:
+            Raises:
+                sqlite3.Error: From the NFO ownership bookkeeping, not caught.
+                Exception: Anything ``edit.apply`` raises while mutating the document.
+
+            Silences:
+                - ``NfoError`` (an unreadable or invalid NFO, which is never overwritten) and
+                  ``OSError`` from the write: logged as a warning, ``False``.
+        """
         seed = NfoSeed(title=edit.seed_title) if edit.seed_title else None
+        owner = NfoOwner(self.nfo_files, edit.owner_key) if edit.owner_key else None
         try:
-            owner = NfoOwner(self.nfo_files, edit.owner_key) if edit.owner_key else None
             update_nfo(edit.nfo_path, edit.nfo_kind, edit.apply, seed, owner)
         except (NfoError, OSError) as exc:
             log.warning("Artwork NFO update failed for %s: %s", edit.nfo_path, exc)
@@ -349,10 +513,19 @@ class ArtworkManager:
 
     def _retire(self, plan: ItemPlan, slot: SlotRecord) -> None:
         """Remove a wrong selection: owned NFO references first, then (once those NFOs are
-        written and verified) owned files, then the slot. User artwork is never touched."""
+        written and verified) owned files, then the slot. User artwork is never touched.
+
+        Contract:
+            Silences:
+                - An owned file that fails a deletion check (changed outside the application,
+                  moved out of the item's folder...) is kept with a warning; the slot then
+                  stays as ``MODIFIED`` instead of being deleted.
+                - A failed NFO write: the post action's ``blocked`` handler sets ``ERROR`` and
+                  keeps files and slot.
+        """
         target = plan.target
         art_type = ArtworkType(slot.artwork_type)
-        requires = []
+        requires: list[str] = []
         for ref in self.repo.refs(slot.id):
             plan._edit(ref.nfo_path, NfoKind(ref.nfo_kind)).removes.append(
                 (RefLocation.from_key(ref.location), ref.url, ref.id))
@@ -374,8 +547,20 @@ class ArtworkManager:
         plan.post.append(PostAction(tuple(requires), run, blocked))
 
     # -- local mode -----------------------------------------------------------------------------------
-    def _refresh_files(self, target: ArtworkTarget, slot: SlotRecord, art_type: ArtworkType) -> list[FileRecord]:
-        """Check recorded files against the disk: follow moves, forget vanished files, flag edits."""
+    def _refresh_files(self, target: ArtworkTarget, slot: SlotRecord, art_type: ArtworkType,
+                       fresh: bool = False) -> list[FileRecord]:
+        """Check recorded files against the disk: follow moves, forget vanished files, flag edits.
+
+        Hashes of unchanged files come from the hash cache unless ``fresh`` (deletions).
+
+        Contract:
+            Silences:
+                - A record whose file is gone and not found (same role, same hash) at a
+                  canonical name is forgotten without a message.
+                - A ``MANAGED`` file whose hash differs, or that cannot be read (hash
+                  ``None``), becomes ``MODIFIED_EXTERNALLY`` for good, with a warning.
+        """
+        digest: Callable[[str], Optional[str]] = file_hash if fresh else self.hashes.hash
         current: list[FileRecord] = []
         names = all_local_names(target, art_type)
         for record in self.repo.files(slot.id):
@@ -387,7 +572,7 @@ class ArtworkManager:
                     continue
                 self.repo.move_file(record.id, moved)
                 record.local_path = path = moved
-            if record.status == MANAGED and file_hash(path) != record.file_hash:
+            if record.status == MANAGED and digest(path) != record.file_hash:
                 self.repo.set_file_status(record.id, MODIFIED_EXTERNALLY)
                 record.status = MODIFIED_EXTERNALLY
                 self.stats.warn(f"{target.label}: {os.path.basename(path)} was changed outside the application; "
@@ -400,12 +585,28 @@ class ArtworkManager:
         for name in names:
             if name.role != record.role:
                 continue
-            for candidate in existing_variants(name.base):
-                if file_hash(candidate) == record.file_hash:
+            for candidate in existing_variants(name.base, self._listings):
+                if self.hashes.hash(candidate) == record.file_hash:
                     return candidate
         return None
 
     def _plan_local(self, plan: ItemPlan, slot: SlotRecord, art_type: ArtworkType, force: bool) -> None:
+        """Local mode for one slot: write the selected image at every wanted canonical name.
+
+        Managed alias copies that are no longer wanted are deleted, and (unless
+        ``artwork_keep_previous``) the slot's managed NFO references are planned for removal.
+
+        Contract:
+            Raises:
+                OSError: Writing or verifying a copy failed (:meth:`_write_local_copies`);
+                    :meth:`_prepare` turns it into an ``ERROR`` slot.
+
+            Silences:
+                - User artwork at a wanted name, or a managed file changed outside the
+                  application without ``force``: ``EXTERNAL`` / ``MODIFIED``, nothing written.
+                - An image that could not be obtained: ``ERROR``, existing files and NFO
+                  references stay.
+        """
         target = plan.target
         records = self._refresh_files(target, slot, art_type)
         desired = local_names(target, art_type, self.settings.artwork_aliases)
@@ -413,60 +614,15 @@ class ArtworkManager:
             self.repo.set_status(slot.id, DISABLED, "no local file name for this item", keep_mode=True)
             self.stats.skipped += 1
             return
-
-        def records_at(base: str) -> list[FileRecord]:
-            return [r for r in records if _same_path(_base(r.local_path), base)]
-
-        needs: list[LocalName] = []
-        kept = modified = False
-        for name in desired:
-            on_disk = existing_variants(name.base)
-            ours = records_at(name.base)
-            owned_paths = [r.local_path for r in ours]
-            unmanaged = [p for p in on_disk if not any(_same_path(p, o) for o in owned_paths)]
-            if unmanaged:
-                # User or third-party artwork: never overwritten, never deleted, nothing added beside it.
-                self.repo.set_status(slot.id, EXTERNAL, f"existing artwork kept: {os.path.basename(unmanaged[0])}",
-                                     keep_mode=True)
-                self.stats.skipped += 1
-                return
-            if not ours:
-                needs.append(name)
-                continue
-            record = ours[0]
-            if record.status == MODIFIED_EXTERNALLY:
-                if force:
-                    needs.append(name)
-                else:
-                    modified = True
-            elif record.source_url != slot.source_url:
-                if force or self.settings.artwork_existing == "replace_managed":
-                    needs.append(name)
-                else:
-                    kept = True
-        if modified:
-            self.repo.set_status(slot.id, MODIFIED, "a managed file was changed outside the application; "
-                                                    "use force replace to overwrite it", keep_mode=True)
-            self.stats.skipped += 1
-            return
+        classified = self._classify_names(slot, desired, records, force)
+        if classified is None:
+            return  # user artwork or an edited managed file: the slot status says why
+        needs, kept = classified
 
         changed = False
         if needs:
-            image = self._obtain(slot, records, keep_existing=kept, private=plan.private.get(slot.artwork_type))
-            if image is None:
+            if not self._write_local_copies(plan, slot, art_type, records, needs, kept):
                 return  # error recorded; NFO references and existing files stay as they are
-            data, image_format, source_url = image
-            extension = FORMAT_EXTENSIONS[image_format]
-            digest = hashlib.sha256(data).hexdigest()
-            for name in needs:
-                path = name.base + extension
-                atomic.atomic_write_bytes(path, data)
-                if file_hash(path) != digest:
-                    raise OSError(f"verification of {os.path.basename(path)} failed")
-                self.repo.record_file(slot.id, name.role, path, digest, len(data), source_url, slot.source_plugin)
-                for old in records_at(name.base):  # same name, other extension: the replaced managed file
-                    if not _same_path(old.local_path, path):
-                        self._delete_managed(target, art_type, old)
             changed = True
 
         # Aliases switched off: managed alias copies are no longer wanted.
@@ -489,14 +645,120 @@ class ArtworkManager:
         if not changed:
             self.stats.unchanged += 1
 
+    def _classify_names(self, slot: SlotRecord, desired: list[LocalName], records: list[FileRecord],
+                        force: bool) -> Optional[tuple[list[LocalName], bool]]:
+        """Which desired names need a (new) file, and whether a newer candidate is declined.
+
+        Returns ``(needs, kept)``, or ``None`` when the slot must be left alone (user artwork
+        at one of the names, or a managed file changed outside the application); the slot
+        status is set in that case.
+
+        Contract:
+            Preconditions:
+                - ``records`` must be the slot's records refreshed by :meth:`_refresh_files`
+                  in this call. This is the only ownership check before a write:
+                  :meth:`_write_local_copies` overwrites whatever is at a needed name.
+                - A record status other than ``MODIFIED_EXTERNALLY`` is treated as managed.
+        """
+        needs: list[LocalName] = []
+        kept = modified = False
+        for name in desired:
+            on_disk = existing_variants(name.base, self._listings)
+            ours = _records_at(records, name.base)
+            owned_paths = [r.local_path for r in ours]
+            unmanaged = [p for p in on_disk if not any(_same_path(p, o) for o in owned_paths)]
+            if unmanaged:
+                # User or third-party artwork: never overwritten, never deleted, nothing added beside it.
+                self.repo.set_status(slot.id, EXTERNAL, f"existing artwork kept: {os.path.basename(unmanaged[0])}",
+                                     keep_mode=True)
+                self.stats.skipped += 1
+                return None
+            if not ours:
+                needs.append(name)
+                continue
+            record = ours[0]
+            if record.status == MODIFIED_EXTERNALLY:
+                if force:
+                    needs.append(name)
+                else:
+                    modified = True
+            elif record.source_url != slot.source_url:
+                if force or self.settings.artwork_existing == "replace_managed":
+                    needs.append(name)
+                else:
+                    kept = True
+        if modified:
+            self.repo.set_status(slot.id, MODIFIED, "a managed file was changed outside the application; "
+                                                    "use force replace to overwrite it", keep_mode=True)
+            self.stats.skipped += 1
+            return None
+        return needs, kept
+
+    def _write_local_copies(self, plan: ItemPlan, slot: SlotRecord, art_type: ArtworkType,
+                            records: list[FileRecord], needs: list[LocalName], kept: bool) -> bool:
+        """Obtain the image once and write (and verify) it at every needed name. False when the
+        image could not be obtained (the error is recorded).
+
+        Contract:
+            Preconditions:
+                - ``needs`` comes from :meth:`_classify_names` for the same ``records``;
+                  ownership is not checked again here.
+
+            Raises:
+                OSError: From the atomic write, or "verification of <name> failed" when the
+                    file read back does not hash to the image. A file this call created where
+                    nothing existed is removed first; a file that existed before is left as
+                    written. Names handled before the failing one keep their new files and
+                    records.
+        """
+        image = self._obtain(slot, records, keep_existing=kept, private=plan.private.get(slot.artwork_type))
+        if image is None:
+            return False
+        data, image_format, source_url = image
+        extension = FORMAT_EXTENSIONS[image_format]
+        digest = hashlib.sha256(data).hexdigest()
+        for name in needs:
+            path = name.base + extension
+            created = not atomic.exists(path) and not os.path.islink(path)
+            atomic.atomic_write_bytes(path, data)
+            self._invalidate_listing(path)
+            if file_hash(path) != digest:
+                if created:
+                    self._remove_unverified(path)
+                raise OSError(f"verification of {os.path.basename(path)} failed")
+            self.repo.record_file(slot.id, name.role, path, digest, len(data), source_url, slot.source_plugin)
+            for old in _records_at(records, name.base):  # same name, other extension: the replaced managed file
+                if not _same_path(old.local_path, path):
+                    self._delete_managed(plan.target, art_type, old)
+        return True
+
+    def _remove_unverified(self, path: str) -> None:
+        """Remove a file this call just created at ``path`` that failed its hash check.
+
+        Nothing existed at ``path`` before the write, so the file is the application's even
+        though it has no record yet. Left behind it would look like user artwork on the next
+        run and block the slot for good. A failed removal is only logged.
+        """
+        try:
+            os.remove(atomic.fs_path(path))
+        except OSError as exc:
+            log.warning("Unverified artwork %s could not be removed: %s", path, exc)
+        self._invalidate_listing(path)
+
     def _obtain(self, slot: SlotRecord, records: list[FileRecord], keep_existing: bool,
-                private: Optional[tuple[str, str, str]] = None) -> Optional[tuple[bytes, str, str]]:
+                private: Optional[PrivateDownload] = None) -> Optional[ObtainedImage]:
         """Image bytes, format and source URL: an intact managed copy when possible, else one download.
 
         With ``keep_existing`` (a newer candidate exists but the managed file is kept) any
         intact managed copy is reused, so compatibility aliases always match the kept file.
         A selected candidate with an authenticated download is tried first; the public URL is
         the fallback and is what gets recorded as the file's source.
+
+        Contract:
+            Silences:
+                - Managed copies that cannot be read, are not an image or no longer match
+                  their recorded hash are skipped.
+                - A failed download sets ``ERROR`` on the slot and returns ``None``.
         """
         for record in records:
             if record.status != MANAGED or (record.source_url != slot.source_url and not keep_existing):
@@ -520,8 +782,16 @@ class ArtworkManager:
         self.stats.downloaded += 1
         return image.data, image.format, slot.source_url
 
-    def _private(self, slot: SlotRecord, private: Optional[tuple[str, str, str]]) -> Optional[tuple[bytes, str]]:
-        """A validated image from the plugin's authenticated download, or ``None`` (use the public URL)."""
+    def _private(self, slot: SlotRecord, private: Optional[PrivateDownload]) -> Optional[tuple[bytes, str]]:
+        """A validated image from the plugin's authenticated download, or ``None`` (use the public URL).
+
+        Contract:
+            Silences:
+                - Everything the plugin's fetch raises, and a payload that is not an image:
+                  logged (info for a rejected payload, warning otherwise), ``None``.
+                - A download offer for another plugin or URL than the stored selection is
+                  ignored.
+        """
         if private is None or self.private_fetch is None:
             return None
         plugin_id, public_url, download_ref = private
@@ -542,6 +812,19 @@ class ArtworkManager:
 
     # -- remote mode ----------------------------------------------------------------------------------
     def _plan_remote(self, plan: ItemPlan, slot: SlotRecord, art_type: ArtworkType) -> None:
+        """Remote mode for one slot: plan NFO reference edits, then (after they are verified)
+        delete the slot's managed local files.
+
+        Contract:
+            Silences:
+                - An NFO location holding a URL that no record owns (user artwork) is skipped;
+                  when no location is usable the slot becomes ``EXTERNAL``.
+                - An unreadable NFO (``NfoError``): ``ERROR``, nothing planned.
+                - Local files are only deleted when the first NFO location (the item's own
+                  NFO when it has one) was usable
+                  and ``artwork_keep_previous`` is off; each deletion goes through
+                  :meth:`_delete_managed`.
+        """
         target = plan.target
         locations = nfo_locations(target, art_type)
         if not locations:
@@ -607,6 +890,16 @@ class ArtworkManager:
         ownership record, path and hash prove it is the application's. Everything else (user
         artwork, files changed outside the application) is kept. Returns False when an owned
         file could not be deleted, so the caller keeps the item's state and retries later.
+
+        Contract:
+            Raises:
+                sqlite3.Error: From the repository, not caught.
+
+            Silences:
+                - Slots with an unknown artwork type are skipped.
+                - A file that vanished before ``os.remove`` counts as removed.
+                - A file failing a safety check is kept with a warning and does not make the
+                  result ``False``.
         """
         ok = True
         for slot in self.repo.slots(target.key):
@@ -614,7 +907,7 @@ class ArtworkManager:
                 art_type = ArtworkType(slot.artwork_type)
             except ValueError:
                 continue
-            for record in self._refresh_files(target, slot, art_type):  # follows moves, flags edits
+            for record in self._refresh_files(target, slot, art_type, fresh=True):  # follows moves, flags edits
                 if record.status != MANAGED:
                     continue
                 path = record.local_path
@@ -637,7 +930,17 @@ class ArtworkManager:
 
     # -- safe deletion --------------------------------------------------------------------------------
     def _delete_managed(self, target: ArtworkTarget, art_type: ArtworkType, record: FileRecord) -> bool:
-        """Delete one application-managed artwork file after every safety check passes."""
+        """Delete one application-managed artwork file after every safety check passes.
+
+        Returns True only when the file was removed.
+
+        Contract:
+            Silences:
+                - A failed safety check or a hash that no longer matches: kept with a warning
+                  (a changed file becomes ``MODIFIED_EXTERNALLY``).
+                - A vanished file: its record is forgotten, ``False``.
+                - ``OSError`` from ``os.remove``: a ``stats.errors`` entry, ``False``.
+        """
         path = record.local_path
         reason = self._unsafe(target, art_type, record)
         if reason:
@@ -655,13 +958,26 @@ class ArtworkManager:
         except OSError as exc:
             self.stats.error(f"{target.label}: local artwork {os.path.basename(path)} could not be deleted: {exc}")
             return False
+        self._invalidate_listing(path)
         self.repo.forget_file(record.id)
         self.stats.local_removed += 1
         log.debug("Removed managed artwork %s", path)
         return True
 
+    def _invalidate_listing(self, path: str) -> None:
+        if self._listings is not None:
+            self._listings.invalidate(os.path.dirname(path))
+
     def _unsafe(self, target: ArtworkTarget, art_type: ArtworkType, record: FileRecord) -> Optional[str]:
-        """Why deleting ``record`` would be unsafe (``None`` = safe)."""
+        """Why deleting ``record`` would be unsafe (``None`` = safe).
+
+        Checks status, slot ownership, library root, item folder (after resolving symlinks),
+        symlink, extension and canonical name; the caller still re-checks the hash.
+
+        Contract:
+            Preconditions:
+                - An empty ``library_root`` makes every deletion unsafe.
+        """
         path = record.local_path
         if record.status != MANAGED:
             return "not managed by this application"

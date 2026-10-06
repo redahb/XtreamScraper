@@ -25,17 +25,19 @@ Any failed step leaves the previous binding and NFO as they were.
 from __future__ import annotations
 
 import logging
-import os
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
 
 from ..filesystem import atomic
+from ..library.index import LibraryIndex
+from ..library.models import LibraryItem, LibrarySeries
 from ..nfo.document import NfoError
 from ..nfo.metadata_writer import apply_manual_ids
-from ..nfo.paths import NfoKind, movie_nfo_path, tvshow_nfo_path
+from ..nfo.paths import NfoKind
 from ..nfo.service import NfoOwner, update_nfo
+from ..storage.artwork import ItemKey
 from ..storage.db import Database
 from ..storage.nfo_files import NfoFileRepository
 from ..storage.scrapers import (
@@ -46,13 +48,18 @@ from ..storage.scrapers import (
     UNMATCHED,
     UNRESOLVED,
     Binding,
+    BindingItemKey,
     ScraperStateRepository,
 )
 from ..utils.redact import redact
 from ..utils.timeutil import now_iso
 from .manager import ScraperManager
+from .models import MetadataResult
 from .plugin import Capability, FieldType, ManualIdError, ManualIdField, ScraperPlugin, ScraperSession
 from .results import FetchStatus, MatchMethod
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..jobs.manager import JobManager
 
 log = logging.getLogger(__name__)
 
@@ -85,11 +92,11 @@ class ItemRef:
     nfo_path: str
 
     @property
-    def binding_key(self) -> tuple:
+    def binding_key(self) -> BindingItemKey:
         return (self.kind, self.provider_id, self.category_id, self.item_id)
 
     @property
-    def owner_key(self) -> tuple:
+    def owner_key(self) -> ItemKey:
         return (self.provider_id, self.kind, self.category_id, self.item_id)
 
     @property
@@ -130,7 +137,7 @@ def _scalar(value: Any) -> Any:
 
 
 class ManualMatchService:
-    def __init__(self, db: Database, scrapers: ScraperManager, jobs: Any = None) -> None:
+    def __init__(self, db: Database, scrapers: ScraperManager, jobs: Optional[JobManager] = None) -> None:
         self.db = db
         self.scrapers = scrapers
         self.jobs = jobs  # JobManager (provider locks, one-item scrape); optional in tests
@@ -193,7 +200,18 @@ class ManualMatchService:
 
         Without ``plugin_id`` an item's state is judged on all enabled plugins: it is matched as
         soon as one of them matched it, unmatched when none did. With ``plugin_id``, on that
-        plugin alone. Each item's ``matched`` flag is always the overall (enabled plugins) one."""
+        plugin alone. Each item's ``matched`` flag is always the overall (enabled plugins) one.
+
+        Contract:
+            Raises:
+                ManualMatchError: ``invalid_filter`` (status or type), ``not_installed`` (404)
+                    for an unknown ``plugin_id``.
+                ValueError, TypeError: ``limit`` / ``offset`` that are not numbers (implicit
+                    ``int()``).
+            Silences:
+                - ``limit`` is clamped to 1..``MAX_LIMIT`` and ``offset`` to >= 0.
+                - Bindings of uninstalled plugins are not shown.
+        """
         if status not in OVERVIEW_FILTERS:
             raise ManualMatchError("invalid_filter", f"status must be one of: {', '.join(OVERVIEW_FILTERS)}")
         if item_kind not in (None, "", *ROOT_KINDS):
@@ -213,7 +231,7 @@ class ManualMatchService:
         total, rows = self.state.root_overview(scope, status, provider_id, item_kind or None, title or "",
                                                limit, offset)
         keys = [(r["kind"], r["provider_id"], r["category_id"], r["item_id"]) for r in rows]
-        by_item: dict[tuple, dict[str, Binding]] = defaultdict(dict)
+        by_item: dict[BindingItemKey, dict[str, Binding]] = defaultdict(dict)
         for b in self.state.bindings_for_items(keys):
             if b.plugin_id in names:
                 by_item[(b.item_kind, b.provider_id, b.category_id, b.item_id)][b.plugin_id] = b
@@ -232,6 +250,13 @@ class ManualMatchService:
 
     @staticmethod
     def _binding_view(b: Binding, name: str) -> dict[str, Any]:
+        """The public view of one binding (message redacted).
+
+        Contract:
+            Silences:
+                - Stored candidates that are not dicts with a scalar ``remote_id`` are dropped;
+                  non-scalar title/year/score become ``None``.
+        """
         candidates = []
         for c in b.candidates or []:
             if isinstance(c, dict) and _scalar(c.get("remote_id")) is not None:
@@ -247,6 +272,13 @@ class ManualMatchService:
 
     # -- the local item ----------------------------------------------------------------------------
     def _item(self, body: dict[str, Any]) -> ItemRef:
+        """The active root item a request names.
+
+        Contract:
+            Raises:
+                ManualMatchError: ``invalid_item`` (malformed identification),
+                    ``item_not_found`` (404), ``item_missing`` (409, missing at its provider).
+        """
         kind = body.get("item_kind")
         category_id, item_id = body.get("category_id"), body.get("item_id")
         try:
@@ -259,24 +291,37 @@ class ManualMatchService:
             raise ManualMatchError("invalid_item", "Identify the item by item_kind (movie or series), provider_id, "
                                                    "category_id and item_id")
         category_id, item_id = str(category_id), str(item_id)
+        index = LibraryIndex(self.db)
+        found: Optional[Union[LibraryItem, LibrarySeries]] = None
         if kind == MOVIE:
-            row = self.db.query_one("SELECT title, year, strm_path AS path, status FROM movies "
-                                    "WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
-                                    (provider_id, category_id, item_id))
+            movies = index.items(provider_id, kinds=(MOVIE,), active_only=False, item=(category_id, item_id))
+            found = movies[0] if movies else None
         else:
-            row = self.db.query_one("SELECT title, year, folder_path AS path, status FROM series "
-                                    "WHERE provider_id = ? AND category_id = ? AND series_id = ?",
-                                    (provider_id, category_id, item_id))
-        if row is None:
+            found = next(iter(index.series(provider_id, active_only=False, item=(category_id, item_id))), None)
+        if found is None:
             raise ManualMatchError("item_not_found", "This item is not in the library", 404)
-        if row["status"] != "active":
+        if found.status != "active":
             raise ManualMatchError("item_missing", "This item is missing at its provider, so it cannot be matched", 409)
-        nfo = movie_nfo_path(os.path.dirname(row["path"])) if kind == MOVIE else tvshow_nfo_path(row["path"])
-        return ItemRef(kind, provider_id, category_id, item_id, row["title"], row["year"], nfo)
+        nfo = found.nfo_path
+        return ItemRef(kind, provider_id, category_id, item_id, found.title, found.year, nfo)
 
     # -- verification --------------------------------------------------------------------------------
     def verify(self, body: dict[str, Any]) -> VerifiedMatch:
-        """Check an entered ID with the plugin and fetch what it points to. Stores nothing."""
+        """Check an entered ID with the plugin and fetch what it points to. Stores nothing.
+
+        Contract:
+            Raises:
+                ManualMatchError: ``not_installed``, ``invalid_item`` / ``item_not_found`` /
+                    ``item_missing``, ``unsupported_media``, ``unsupported_namespace``,
+                    ``invalid_format``, ``not_configured``, ``plugin_unavailable`` (session
+                    start failed), ``not_found``, ``api_error``. Every message is redacted.
+            Silences:
+                - An exception from ``normalize_manual_id`` other than ``ManualIdError`` is
+                  logged and reported as ``invalid_format``.
+                - Any exception from the plugin while resolving or fetching becomes
+                  ``api_error`` (logged redacted); the session is always closed and its status
+                  recorded (failures there are only logged).
+        """
         plugin = self._plugin(body.get("plugin_id"))
         name = self._name(plugin)
         item = self._item(body)
@@ -329,12 +374,13 @@ class ManualMatchService:
                              meta.title, meta.year, external_ids, manual_ids)
 
     @staticmethod
-    def _failure(session: ScraperSession, name: str, message: Optional[str], secrets: list) -> ManualMatchError:
+    def _failure(session: ScraperSession, name: str, message: Optional[str],
+                 secrets: list[Optional[str]]) -> ManualMatchError:
         text = session.suspended or message or "request failed"
         return ManualMatchError("api_error", redact(f"{name}: {text}", secrets), 502)
 
     def _resolve(self, session: ScraperSession, name: str, item: ItemRef, id_field: ManualIdField, value: str,
-                 secrets: list) -> str:
+                 secrets: list[Optional[str]]) -> str:
         outcome = session.resolve_manual_id(item.kind, id_field.namespace, value)
         if outcome.status is FetchStatus.OK and outcome.remote_id:
             return str(outcome.remote_id)
@@ -347,7 +393,7 @@ class ManualMatchService:
         raise ManualMatchError("unsupported_namespace", f"{name} cannot look up a {id_field.label}")
 
     def _fetch(self, session: ScraperSession, name: str, item: ItemRef, id_field: ManualIdField, value: str,
-               remote_id: str, secrets: list):
+               remote_id: str, secrets: list[Optional[str]]) -> MetadataResult:
         fetch = session.get_movie if item.kind == MOVIE else session.get_series
         outcome = fetch(remote_id)
         if outcome.status is FetchStatus.OK and outcome.metadata is not None:
@@ -360,7 +406,7 @@ class ManualMatchService:
             raise self._failure(session, name, outcome.message, secrets)
         raise ManualMatchError("unsupported_media", f"{name} cannot fetch {KIND_LABEL[item.kind]} by ID")
 
-    def _finish(self, plugin_id: str, session: ScraperSession, secrets: list) -> None:
+    def _finish(self, plugin_id: str, session: ScraperSession, secrets: list[Optional[str]]) -> None:
         try:
             update = session.status_update()
             if update:
@@ -411,15 +457,27 @@ class ManualMatchService:
     def _edit_nfo(self, item: ItemRef, assign: dict[str, str], remove: dict[str, str]) -> None:
         if not atomic.is_file(item.nfo_path) or (not assign and not remove):
             return  # the next scrape writes the IDs into a new NFO
+        owner = NfoOwner(self.nfo_files, item.owner_key)
         try:
-            update_nfo(item.nfo_path, item.nfo_kind, lambda doc: apply_manual_ids(doc, assign, remove),
-                       owner=NfoOwner(self.nfo_files, item.owner_key))
+            update_nfo(item.nfo_path, item.nfo_kind, lambda doc: apply_manual_ids(doc, assign, remove), owner=owner)
         except (NfoError, OSError) as exc:
             raise ManualMatchError("nfo_failed", f"The NFO file could not be updated, so nothing was changed: {exc}",
                                    409) from None
 
     def assign(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Verify again, then store the confirmed ID and scrape the item."""
+        """Verify again, then store the confirmed ID and scrape the item.
+
+        Contract:
+            Raises:
+                ManualMatchError: Everything :meth:`verify` raises, plus ``busy`` (a job holds
+                    the provider), ``conflict`` (another plugin's manual ID differs) and
+                    ``nfo_failed`` (nothing changed).
+                sqlite3.Error: From storing the binding (not caught). The NFO already holds
+                    the new IDs then.
+            Silences:
+                - A scrape that cannot start (plugin disabled, provider busy) only adds a
+                  ``note``; the match is stored anyway.
+        """
         verified = self.verify(body)
         item, plugin = verified.item, self._plugin(verified.plugin_id)
         with self._locked(item):
@@ -451,7 +509,16 @@ class ManualMatchService:
         return {"match": verified.public_dict(), "job": job, "note": note}
 
     def remove(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Withdraw a manual match: the item is matched automatically again."""
+        """Withdraw a manual match: the item is matched automatically again.
+
+        Contract:
+            Raises:
+                ManualMatchError: ``not_installed``, ``invalid_item`` / ``item_not_found`` /
+                    ``item_missing``, ``busy``, ``no_manual_match`` (409), ``nfo_failed``.
+            Silences:
+                - IDs another plugin's manual match also holds stay in the NFO; IDs changed in
+                  the NFO since are left as they are (``apply_manual_ids``).
+        """
         plugin = self._plugin(body.get("plugin_id"))
         item = self._item(body)
         with self._locked(item):
@@ -467,8 +534,14 @@ class ManualMatchService:
         job, note = self._scrape(item, plugin)
         return {"removed": True, "job": job, "note": note}
 
-    def _scrape(self, item: ItemRef, plugin: ScraperPlugin) -> tuple[Optional[dict], Optional[str]]:
-        """Start the one-item scrape when the plugin can run; otherwise say when it happens."""
+    def _scrape(self, item: ItemRef, plugin: ScraperPlugin) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Start the one-item scrape when the plugin can run; otherwise say when it happens.
+
+        Contract:
+            Silences:
+                - ``BusyError`` from the job manager: no job, a note. Without a job manager
+                  (tests): ``(None, None)``.
+        """
         name = self._name(plugin)
         entry = next((p for p in self._installed() if p["plugin_id"] == plugin.plugin_id), None)
         if self.jobs is None:

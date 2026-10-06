@@ -92,6 +92,19 @@ _BOOLEAN = {"enabled", "movies_enabled", "series_enabled"}
 
 
 def _clean(values: Mapping[str, Any], existing: Optional[Provider]) -> dict[str, Any]:
+    """The editable columns of ``values``, normalised, after validating the merged provider.
+
+    Only keys in ``values`` are returned, so an edit changes only what it names. Booleans
+    accept ``True``/``1`` and ``"1"``/``"true"``/``"on"``/``"yes"`` (any case); anything else,
+    including ``None`` or a typo, silently becomes 0 (off). Text is stripped (``None`` -> ``""``,
+    the password excepted). A blank or missing password keeps the stored one.
+
+    Contract:
+        Raises:
+            ProviderValidationError: When the merged provider (``existing`` + edit) has no name,
+                base URL, username or password, or a target folder that is not absolute.
+                Also for a base URL ``urlsplit`` rejects (e.g. ``http://[::1``).
+    """
     data: dict[str, Any] = {}
     for key in _EDITABLE:
         if key not in values:
@@ -107,7 +120,10 @@ def _clean(values: Mapping[str, Any], existing: Optional[Provider]) -> dict[str,
         else:
             data[key] = "" if raw is None else str(raw).strip()
     if "base_url" in data:
-        data["base_url"] = normalize_base_url(data["base_url"])
+        try:
+            data["base_url"] = normalize_base_url(data["base_url"])
+        except ValueError:  # urlsplit rejects it, e.g. an unbalanced IPv6 bracket
+            raise ProviderValidationError("Base URL is not a valid URL") from None
 
     merged = {**(existing.__dict__ if existing else {}), **data}
     if not str(merged.get("name", "")).strip():
@@ -125,6 +141,8 @@ def _clean(values: Mapping[str, Any], existing: Optional[Provider]) -> dict[str,
 
 
 class ProviderRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -152,12 +170,21 @@ class ProviderRepository:
         with self.db.transaction() as conn:
             cur = conn.execute(f"INSERT INTO providers ({columns}) VALUES ({placeholders})", tuple(data.values()))
             provider_id = cur.lastrowid
+        assert provider_id is not None  # set by every successful INSERT
         register_secrets([data.get("username"), data.get("password")])
-        provider = self.get(int(provider_id))
+        provider = self.get(provider_id)
         assert provider is not None
         return provider
 
     def update(self, provider_id: int, values: Mapping[str, Any]) -> Provider:
+        """Apply an edit (see :func:`_clean`) and return the stored provider.
+
+        Contract:
+            Raises:
+                KeyError: For an unknown ``provider_id`` (explicit).
+                ProviderValidationError: When the edited provider would be invalid; nothing is
+                    written.
+        """
         existing = self.get(provider_id)
         if existing is None:
             raise KeyError(provider_id)

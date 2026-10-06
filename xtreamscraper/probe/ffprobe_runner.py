@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -22,6 +23,42 @@ log = logging.getLogger(__name__)
 
 IS_WINDOWS = os.name == "nt"
 FFPROBE_NAME = "ffprobe.exe" if IS_WINDOWS else "ffprobe"
+
+
+#: The only executable names a configured ffprobe path may end in (compared case-insensitively).
+FFPROBE_FILE_NAMES = ("ffprobe", "ffprobe.exe")
+
+
+def _is_network_path(value: str) -> bool:
+    """UNC and device paths: ``\\\\server\\share``, ``//server/share``, ``\\\\?\\UNC\\...``, ``\\??\\...``."""
+    return (len(value) >= 2 and value[0] in "\\/" and value[1] in "\\/") or value.startswith("\\??\\")
+
+
+def ffprobe_path_problem(path: str) -> Optional[str]:
+    """Why a configured ffprobe path is refused, or ``None`` when it is acceptable.
+
+    A network path is refused before the file system is touched (opening one would connect to
+    that server). Otherwise the path must name ``ffprobe``/``ffprobe.exe`` or a folder (which
+    then must contain it), so the setting cannot run an arbitrary program.
+
+    Contract:
+        Preconditions:
+            - A folder is accepted as is (``os.path.isdir`` touches the local file system);
+              :func:`locate_ffprobe` then appends the platform's ``ffprobe`` name.
+        Silences:
+            - A blank path is acceptable (``None``): it means "not configured".
+    """
+    value = (path or "").strip().strip('"')
+    if not value:
+        return None
+    if _is_network_path(value):
+        return "network (UNC) paths are not allowed for ffprobe; use a folder on a local drive"
+    if value[-1] in "\\/" or os.path.isdir(value):
+        return None
+    name = re.split(r"[\\/]", value)[-1]
+    if name.lower() not in FFPROBE_FILE_NAMES:
+        return f"the ffprobe path must end in ffprobe.exe (or be the folder that contains it), not '{name}'"
+    return None
 
 
 class ProbeError(Exception):
@@ -40,14 +77,25 @@ class ProbeOptions:
 def locate_ffprobe(configured: str = "", app_root: str = "") -> tuple[Optional[str], str]:
     """Return ``(path, how_found)``.
 
-    Order: configured path > ``ffprobe(.exe)`` next to the application (also ``bin/`` and
-    ``ffmpeg/bin/``) > system ``PATH``.
+    Order: configured path > ``ffprobe(.exe)`` next to the application (also ``bin/``,
+    ``ffmpeg/bin/`` and ``ffmpeg/``) > system ``PATH``.
+
+    Contract:
+        Silences:
+            - A configured path that is refused or not found gives ``(None, reason)`` and does
+              not fall back to the other locations. The application folder and ``PATH`` are
+              trusted without the name check.
     """
     if configured:
         candidate = configured.strip().strip('"')
+        if _is_network_path(candidate):  # checked before any file system access
+            return None, f"configured path refused: {ffprobe_path_problem(candidate)}"
         if os.path.isdir(candidate):
             candidate = os.path.join(candidate, FFPROBE_NAME)
         if os.path.isfile(candidate):
+            problem = ffprobe_path_problem(candidate)
+            if problem:
+                return None, f"configured path refused: {problem}"
             return candidate, "configured path"
         return None, f"configured path not found: {candidate}"
     if app_root:
@@ -66,6 +114,16 @@ def _creationflags() -> int:
 
 
 def ffprobe_version(path: str) -> str:
+    """The first line of ``ffprobe -version``.
+
+    Contract:
+        Raises:
+            ProbeError: ``path`` fails :func:`ffprobe_path_problem`, cannot be started, takes
+                more than 15 s or exits non-zero.
+    """
+    problem = ffprobe_path_problem(path)
+    if problem:
+        raise ProbeError(f"Refusing to run {path}: {problem}")
     try:
         result = subprocess.run(
             [path, "-hide_banner", "-version"], capture_output=True, timeout=15, creationflags=_creationflags()
@@ -100,6 +158,20 @@ def build_command(ffprobe: str, url: str, options: ProbeOptions) -> list[str]:
 
 
 def run_ffprobe(ffprobe: str, url: str, options: ProbeOptions) -> dict[str, Any]:
+    """Run ffprobe on ``url`` and return its parsed JSON output.
+
+    Contract:
+        Preconditions:
+            - ``ffprobe`` must come from :func:`locate_ffprobe`; this function does not repeat
+              the name check.
+        Raises:
+            ProbeError: Timeout, start failure, a non-zero exit (with the redacted last
+                stderr line, at most 500 characters) or invalid JSON.
+        Silences:
+            - Valid JSON that is not an object (a list, a number) is returned as is despite
+              the annotation; :func:`map_ffprobe` treats it as empty. Undecodable output
+              bytes are replaced before parsing; empty output gives ``{}``.
+    """
     cmd = build_command(ffprobe, url, options)
     try:
         result = subprocess.run(

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Mapping
+from typing import Any, Final, Mapping
 
+from ..probe.ffprobe_runner import ffprobe_path_problem
 from ..storage.db import Database
 
 log = logging.getLogger(__name__)
 
-LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_LEVELS: Final[tuple[str, ...]] = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 @dataclass
@@ -19,6 +22,9 @@ class Settings:
     # Web server (changes need a restart)
     web_host: str = "127.0.0.1"
     web_port: int = 6060
+    # Extra host names (comma-separated) the WebUI answers to besides loopback, the bind address
+    # and this machine's name; every other Host header is refused (DNS-rebinding protection).
+    allowed_hosts: str = ""
     # Library
     default_target_folder: str = ""
     clean_titles: bool = True
@@ -106,7 +112,7 @@ _CHOICES: dict[str, tuple[str, ...]] = {
 }
 
 #: Settings whose change requires artwork reconciliation of the existing library.
-ARTWORK_RECONCILE_KEYS = (
+ARTWORK_RECONCILE_KEYS: Final[tuple[str, ...]] = (
     "artwork_mode", "artwork_movie_poster", "artwork_movie_fanart", "artwork_show_poster", "artwork_show_fanart",
     "artwork_season_poster", "artwork_episode_still", "artwork_clearlogo", "artwork_banner", "artwork_landscape",
     "artwork_keyart", "artwork_existing", "artwork_aliases",
@@ -117,8 +123,67 @@ class SettingsError(ValueError):
     pass
 
 
+_HOST_LABEL = re.compile(r"(?!-)[a-z0-9_-]{1,63}(?<!-)")
+MAX_ALLOWED_HOSTS: Final = 50
+
+
+def parse_host_list(value: str) -> list[str]:
+    """``"NAS.local, [fd00::1]"`` -> ``["nas.local", "fd00::1"]``; raises :class:`SettingsError`.
+
+    Entries are host names or IP addresses without scheme, port or wildcard.
+
+    Contract:
+        Preconditions:
+            - ``;`` and ``,`` both separate entries; blanks are skipped; a trailing dot is
+              dropped; duplicates (after lower-casing and IP normalisation) are kept once.
+
+        Raises:
+            SettingsError: For an entry that is neither an IP address nor a valid host name
+                (each label 1-63 of ``[a-z0-9_-]``, no leading/trailing ``-``, at most 253
+                characters), or for more than ``MAX_ALLOWED_HOSTS`` distinct entries.
+    """
+    hosts: list[str] = []
+    for raw in str(value or "").replace(";", ",").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        bare = entry[1:-1] if entry.startswith("[") and entry.endswith("]") else entry
+        try:
+            host = str(ipaddress.ip_address(bare))
+        except ValueError:
+            host = bare.rstrip(".")
+            if len(host) > 253 or not all(_HOST_LABEL.fullmatch(label) for label in host.split(".")):
+                raise SettingsError(f"allowed_hosts: '{raw.strip()}' is not a host name or IP address "
+                                    "(no scheme, port or wildcard)") from None
+        if host not in hosts:
+            hosts.append(host)
+    if len(hosts) > MAX_ALLOWED_HOSTS:
+        raise SettingsError(f"allowed_hosts: at most {MAX_ALLOWED_HOSTS} entries")
+    return hosts
+
+
 def coerce_settings(values: Mapping[str, Any], base: Settings | None = None) -> Settings:
-    """Validate and convert raw values (e.g. from JSON) onto ``base``. Unknown keys are ignored."""
+    """Validate and convert raw values (e.g. from JSON) onto ``base``. Unknown keys are ignored.
+
+    The type of each field's default decides the conversion; ``base`` is not modified.
+
+    Contract:
+        Raises:
+            SettingsError: When a value cannot be converted (``TypeError``, ``ValueError`` and
+                ``OverflowError`` are turned into it), is outside ``_BOUNDS`` (NaN and
+                infinity included), is not one of ``_CHOICES`` or ``LOG_LEVELS``, is a refused
+                ffprobe path, or is a bad ``allowed_hosts`` list. Raised on the first bad
+                field; nothing is returned in that case.
+
+        Silently converts (no error):
+            - Int fields use ``int(float(raw))``: ``"3.9"`` becomes 3 and ``True`` becomes 1.
+            - Bool fields: a string is true only for ``1``, ``true``, ``yes`` or ``on`` (any
+              case); every other string, ``"enabled"`` included, is false. Non-strings use
+              ``bool()``, so ``[1]`` is true.
+            - Str fields take ``str(raw)`` of any value (a dict becomes its repr); ``None``
+              becomes ``""``.
+            - The ffprobe path check looks at the file system (``os.path.isdir``).
+    """
     current = asdict(base or Settings())
     for f in fields(Settings):
         if f.name not in values:
@@ -137,7 +202,7 @@ def coerce_settings(values: Mapping[str, Any], base: Settings | None = None) -> 
                 value = float(raw)
             else:
                 value = "" if raw is None else str(raw).strip()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: int(float("inf"))
             raise SettingsError(f"Invalid value for {f.name}") from None
         if f.name in _BOUNDS:
             low, high = _BOUNDS[f.name]
@@ -147,6 +212,13 @@ def coerce_settings(values: Mapping[str, Any], base: Settings | None = None) -> 
             value = str(value).lower()
             if value not in _CHOICES[f.name]:
                 raise SettingsError(f"{f.name} must be one of {', '.join(_CHOICES[f.name])}")
+        if f.name == "ffprobe_path":
+            value = value.strip('"').strip()
+            problem = ffprobe_path_problem(value)
+            if problem:
+                raise SettingsError(f"ffprobe_path: {problem}")
+        if f.name == "allowed_hosts":
+            value = ", ".join(parse_host_list(value))
         if f.name == "log_level":
             value = str(value).upper()
             if value not in LOG_LEVELS:
@@ -156,10 +228,25 @@ def coerce_settings(values: Mapping[str, Any], base: Settings | None = None) -> 
 
 
 class SettingsStore:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
     def load(self) -> Settings:
+        """The stored settings over the defaults; never fails on a bad stored value.
+
+        Contract:
+            Raises:
+                sqlite3.Error: When the ``settings`` table cannot be read (not caught).
+
+            Silences:
+                - A row whose value is not valid JSON is skipped with a warning.
+                - When the stored values do not validate together, each field is validated on
+                  its own and an invalid one keeps its default, with a warning. The reset is in
+                  memory only, so it is logged again on every load, and the next :meth:`save`
+                  writes the default for that field.
+        """
         stored: dict[str, Any] = {}
         for row in self.db.query("SELECT key, value FROM settings"):
             try:
@@ -180,6 +267,13 @@ class SettingsStore:
             return result
 
     def save(self, values: Mapping[str, Any]) -> Settings:
+        """Validate ``values`` onto the stored settings and persist every field in one transaction.
+
+        Contract:
+            Raises:
+                SettingsError: From :func:`coerce_settings` before anything is written.
+                sqlite3.Error: From the database; the transaction is rolled back.
+        """
         merged = coerce_settings(values, self.load())
         with self.db.transaction() as conn:
             for key, value in merged.to_dict().items():

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Iterable, Optional, cast
 
 from .models import Artwork, ArtworkType
 
@@ -42,7 +42,7 @@ class PluginArtwork:
 
 def language_code(value: Optional[str]) -> Optional[str]:
     """``"en-US"`` -> ``"en"``; blanks and "no language" markers -> ``None`` (neutral)."""
-    code = (value or "").strip().lower().replace("_", "-").split("-")[0]
+    code = (value or "").strip().lower().replace("_", "-").split("-")[0].strip()
     return None if code in _NEUTRAL_CODES else code
 
 
@@ -51,7 +51,7 @@ def slot_of(art: Artwork) -> Slot:
     return art_type, (art.season_number if art_type is ArtworkType.SEASON_POSTER else None)
 
 
-def _rank(art: Artwork, index: int, preferred: Optional[str]) -> tuple:
+def _rank(art: Artwork, index: int, preferred: Optional[str]) -> tuple[int, float, int, int, int, str]:
     code = language_code(art.language)
     if ArtworkType(art.type) in NEUTRAL_FIRST:
         group = 0 if code is None else 1 if code == preferred else 2
@@ -67,6 +67,13 @@ def best_per_slot(candidates: Iterable[Artwork], language: Optional[str] = None)
     Listings of the same URL (compared case-insensitively, ignoring a trailing slash)
     count once, and the best-ranked listing of a URL is the one that competes, so the
     result never depends on the order of duplicates.
+
+    Contract:
+        Raises:
+            ValueError: A candidate whose ``type`` is not an :class:`ArtworkType` value
+                (implicit, ``ArtworkType(art.type)``).
+        Silences:
+            - Candidates without a URL and person images are skipped.
     """
     preferred = language_code(language) or "en"
     best: dict[Slot, tuple[tuple, Artwork]] = {}
@@ -92,6 +99,14 @@ def select_artwork(
     run and ``reported`` the plugins that answered this time: a stored selection of a
     higher-priority plugin that could not answer now (e.g. an API error) is kept rather
     than silently replaced by a lower-priority plugin without overwrite.
+
+    Contract:
+        Preconditions:
+            - ``plugins`` have distinct ``plugin_id`` values.
+        Silences:
+            - A stored selection of a plugin no longer in ``plugins`` is ignored.
+        Raises:
+            ValueError: An unknown artwork type (see :func:`best_per_slot`).
     """
     selected: dict[Slot, Artwork] = {}
     order = {p.plugin_id: i for i, p in enumerate(plugins)}
@@ -112,6 +127,9 @@ def select_artwork(
         if source not in order or source in reported:
             continue
         new = selected.get(slot)
-        if new is not None and order[new.source_plugin] > order[source] and not overwrite[new.source_plugin]:
+        if new is None:
+            continue
+        winner = cast(str, new.source_plugin)  # always set above
+        if order[winner] > order[source] and not overwrite[winner]:
             selected[slot] = old
     return selected

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar, Union
 
 MEDIA_SCHEMA_VERSION = 2
 
@@ -73,7 +73,11 @@ class SubtitleStreamInfo:
     flags: list[str] = field(default_factory=list)
 
 
-def _has_value(stream: Any) -> bool:
+StreamInfo = Union["VideoStreamInfo", "AudioStreamInfo", "SubtitleStreamInfo"]
+_Stream = TypeVar("_Stream", "VideoStreamInfo", "AudioStreamInfo", "SubtitleStreamInfo")
+
+
+def _has_value(stream: StreamInfo) -> bool:
     return any(value not in (None, [], "") for value in asdict(stream).values())
 
 
@@ -85,7 +89,8 @@ class MediaInfo:
     duration_seconds: Optional[int] = None
 
     def has_useful_data(self) -> bool:
-        return any(_has_value(s) for s in (*self.video_streams, *self.audio_streams, *self.subtitle_streams))
+        streams: list[StreamInfo] = [*self.video_streams, *self.audio_streams, *self.subtitle_streams]
+        return any(_has_value(s) for s in streams)
 
     # -- persistence (probe state) ------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -96,7 +101,18 @@ class MediaInfo:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MediaInfo":
-        def build(model, items):
+        """Rebuild a :class:`MediaInfo` from :meth:`to_dict` output (stored probe state).
+
+        Contract:
+            Raises:
+                TypeError: A stream list is a non-iterable truthy value such as a number
+                    (implicit, from the ``for`` loop in ``build``).
+            Silences:
+                - Stream entries that are not dicts and keys that are not fields are dropped;
+                  missing fields take their defaults. Values are not type-checked, so a
+                  string where an int belongs is kept as is.
+        """
+        def build(model: type[_Stream], items: Any) -> list[_Stream]:
             names = {f.name for f in fields(model)}
             return [model(**{k: v for k, v in item.items() if k in names})
                     for item in items or [] if isinstance(item, dict)]
@@ -110,6 +126,16 @@ class MediaInfo:
 
     @classmethod
     def from_json(cls, text: Optional[str]) -> Optional["MediaInfo"]:
+        """The :class:`MediaInfo` stored by :meth:`to_json`, or ``None`` when it cannot be used.
+
+        Contract:
+            Raises:
+                TypeError: As :meth:`from_dict`, for valid JSON of this schema whose stream
+                    list is a number.
+            Silences:
+                - Empty text, invalid JSON, a non-object and another ``schema`` version all
+                  give ``None`` (the item is then re-probed); the caller cannot tell them apart.
+        """
         if not text:
             return None
         try:

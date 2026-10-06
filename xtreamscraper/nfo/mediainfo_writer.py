@@ -134,6 +134,14 @@ def apply_media_info(doc: NfoDocument, media: MediaInfo) -> bool:
     The existing ``<fileinfo>`` is reused (never duplicated) and its other children are
     kept; everything outside ``<fileinfo>`` is untouched. Returns ``False`` without
     changing anything when ``media`` holds no meaningful stream information.
+
+    Contract:
+        Raises:
+            ValueError: ``doc`` is not a movie or episode NFO (explicit check).
+        Silences:
+            - Values outside the approved vocabulary, zero, negative or blank are not
+              written; a stream left without any field is dropped. Only the first
+              ``<fileinfo>`` is used; every ``<streamdetails>`` under it is replaced.
     """
     if doc.kind not in STREAM_NFO_KINDS:
         raise ValueError(f"Stream details belong in movie or episode NFOs, not <{doc.root.tag}>")

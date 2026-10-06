@@ -4,18 +4,25 @@ Xtream panels are inconsistent: numbers arrive as strings, lists arrive as dicts
 single object arrives where a list is expected, fields are null or missing entirely.
 Every parser here accepts "anything" and returns clean models, skipping individual
 malformed records (reported through ``warnings``) instead of failing the whole list.
+
+A skipped record whose stable ID can still be read is reported as "listed but unparsed"
+(``ParsedRecords.unparsed_ids`` / ``SeriesDetails.unparsed_episode_ids``): the provider
+still lists that item, so the sync must neither update it nor treat it as missing.
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Optional, TypeVar
+from typing import Any, Callable, Iterable, Iterator, List, Optional, TypeVar
 
 from .models import AccountInfo, Category, Episode, SeasonInfo, SeriesDetails, SeriesEntry, VodStream
 from .urls import DEFAULT_EPISODE_EXTENSION, DEFAULT_MOVIE_EXTENSION, clean_extension
 
 T = TypeVar("T")
+
+# One JSON object from a provider answer (a movie, series, episode, season or category record).
+RawRecord = dict[str, Any]
 
 _YEAR_IN_TEXT = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 _SXXEYY = re.compile(r"\bS(\d{1,3})\s*E(\d{1,4})\b", re.IGNORECASE)
@@ -24,6 +31,16 @@ _EPISODE_ONLY = re.compile(r"\b(?:E|EP|Episode)\s*(\d{1,4})\b", re.IGNORECASE)
 
 # -- scalar conversion -------------------------------------------------------------------
 def to_int(value: Any) -> Optional[int]:
+    """Integer value of a provider number, or None.
+
+    Contract:
+        Silences:
+            - Never raises. ``None``, ``bool``, blanks, containers, fractional values
+              (``1.5``, ``"1.5"``), ``nan``/``inf`` and unparseable text all give None.
+            - Accepts float text: ``"12.0"`` and ``"1e3"`` give 12 and 1000. A digit
+              string past Python's int-digit limit falls through to ``float`` and gives
+              None (it becomes ``inf``).
+    """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -63,7 +80,16 @@ def to_opt_str(value: Any) -> Optional[str]:
 
 
 def to_id(value: Any) -> Optional[str]:
-    """Canonical string form of a provider ID (``"0042"`` and ``42`` are the same ID)."""
+    """Canonical string form of a provider ID (``"0042"`` and ``42`` are the same ID).
+
+    Contract:
+        Silences:
+            - Never raises; None means "no usable ID".
+            - Anything ``to_int`` reads as an integer becomes its decimal form, so
+              ``"1e3"`` -> ``"1000"`` and ``"12.0"`` -> ``"12"``; a negative number gives None.
+            - Other text is kept (stripped) when it is 1-64 characters without ``/ \\ ? #``,
+              so ``"inf"`` or ``"mv 12"`` are valid text IDs; longer text gives None.
+    """
     number = to_int(value)
     if number is not None:
         return str(number) if number >= 0 else None
@@ -74,6 +100,13 @@ def to_id(value: Any) -> Optional[str]:
 
 
 def valid_year(value: Any) -> Optional[int]:
+    """``value`` as a year in 1900..(this year + 5), else None.
+
+    Contract:
+        Silences:
+            - The upper bound reads the local clock (``datetime.now()``), so the same
+              input can be rejected today and accepted in a later year.
+    """
     year = to_int(value)
     if year is None:
         return None
@@ -81,7 +114,15 @@ def valid_year(value: Any) -> Optional[int]:
 
 
 def year_from_date(value: Any) -> Optional[int]:
-    """Year from a provider date like ``2001-10-26`` / ``26/10/2001``; ignores placeholders."""
+    """Year from a provider date like ``2001-10-26`` / ``26/10/2001``; ignores placeholders.
+
+    Contract:
+        Silences:
+            - Only ISO-ordered placeholders (``1970-01-01``, ``1900-01-01``, ``0000...``)
+              are recognised; ``01/01/1970`` yields 1970.
+            - Takes the first 19xx/20xx group anywhere in the text, then applies
+              ``valid_year`` (clock-dependent upper bound).
+    """
     text = to_str(value)
     if not text or text.startswith(("1970-01-01", "1900-01-01", "0000")):
         return None
@@ -90,6 +131,13 @@ def year_from_date(value: Any) -> Optional[int]:
 
 
 def unix_to_iso(value: Any) -> Optional[str]:
+    """UTC ISO-8601 timestamp (seconds) for a Unix time, or None.
+
+    Contract:
+        Silences:
+            - Zero, negatives, unparseable values and timestamps the platform cannot
+              convert (``OverflowError``/``OSError``/``ValueError``) all give None.
+    """
     number = to_int(value)
     if number is None or number <= 0:
         return None
@@ -100,7 +148,14 @@ def unix_to_iso(value: Any) -> Optional[str]:
 
 
 def as_list(value: Any) -> list[Any]:
-    """Lists pass through, dict-of-records becomes its values, a single object is wrapped."""
+    """Lists pass through, dict-of-records becomes its values, a single object is wrapped.
+
+    Contract:
+        Silences:
+            - Any other dict is wrapped as ``[dict]``, including error objects and ``{}``;
+              they then fail as ID-less records. ``is_error_object`` tells such answers apart.
+            - Scalars and None give ``[]``. A list is returned as is (not copied).
+    """
     if value is None:
         return []
     if isinstance(value, list):
@@ -117,8 +172,45 @@ def as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _parse_all(items: Iterable[Any], parse: Callable[[dict], Optional[T]], label: str, warnings: list[str]) -> list[T]:
-    result: list[T] = []
+class ParsedRecords(List[T]):
+    """Parsed models, plus the stable IDs of listed records that could not be parsed."""
+
+    def __init__(self, items: Iterable[T] = (), unparsed_ids: Iterable[str] = ()) -> None:
+        super().__init__(items)
+        self.unparsed_ids: set[str] = set(unparsed_ids)
+
+
+def _raw_id(raw: RawRecord, *keys: str) -> Optional[str]:
+    """The record's stable ID read straight from the raw object, if it is usable."""
+    for key in keys:
+        try:
+            value = to_id(raw.get(key))
+        except Exception:  # pragma: no cover - to_id is defensive; this is belt and braces
+            value = None
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_all(
+    items: Iterable[Any],
+    parse: Callable[[RawRecord], Optional[T]],
+    label: str,
+    warnings: list[str],
+    id_key: str,
+) -> ParsedRecords[T]:
+    """Parse every record, skipping bad ones; one bad record never sinks the list.
+
+    Contract:
+        Silences:
+            - Non-object records and records ``parse`` returns None for (no ID) are
+              skipped with a warning appended to ``warnings``.
+            - Any ``Exception`` from ``parse`` is caught: the record is skipped with a
+              warning, and if ``id_key`` still yields an ID it goes to ``unparsed_ids``
+              (the sync keeps such items as listed, never missing).
+            - Duplicates are not removed here.
+    """
+    result: ParsedRecords[T] = ParsedRecords()
     for index, raw in enumerate(items):
         if not isinstance(raw, dict):
             warnings.append(f"Skipped malformed {label} record #{index} (not an object)")
@@ -126,7 +218,13 @@ def _parse_all(items: Iterable[Any], parse: Callable[[dict], Optional[T]], label
         try:
             parsed = parse(raw)
         except Exception as exc:  # one bad record must never sink the list
-            warnings.append(f"Skipped malformed {label} record #{index}: {exc}")
+            rid = _raw_id(raw, id_key)
+            if rid is None:
+                warnings.append(f"Skipped malformed {label} record #{index}: {exc}")
+            else:
+                # Still listed: the sync keeps the stored item as it is (never "missing").
+                result.unparsed_ids.add(rid)
+                warnings.append(f"Skipped malformed {label} record #{index} (ID {rid}, kept as listed): {exc}")
             continue
         if parsed is None:
             name = to_str(raw.get("name") or raw.get("title") or raw.get("category_name"))
@@ -136,8 +234,19 @@ def _parse_all(items: Iterable[Any], parse: Callable[[dict], Optional[T]], label
     return result
 
 
+def is_error_object(data: Any, records: ParsedRecords[Any]) -> bool:
+    """Did a list endpoint answer an object that holds no record at all?
+
+    Panels answer HTTP 200 with objects such as ``{"user_info": {"auth": 0}}`` (account
+    expired or blocked) or ``{"error": "..."}`` (rate limited). Such an answer is a failed
+    request, never an empty category: a real empty listing is ``[]``, ``{}`` or an empty
+    body, and a real dict-of-records always has at least one readable ID.
+    """
+    return isinstance(data, dict) and bool(data) and not records and not records.unparsed_ids
+
+
 # -- categories ---------------------------------------------------------------------------
-def _category(raw: dict) -> Optional[Category]:
+def _category(raw: RawRecord) -> Optional[Category]:
     cid = to_id(raw.get("category_id"))
     if cid is None:
         return None
@@ -145,13 +254,22 @@ def _category(raw: dict) -> Optional[Category]:
     return Category(category_id=cid, name=name, parent_id=to_id(raw.get("parent_id")))
 
 
-def parse_categories(data: Any, warnings: Optional[list[str]] = None) -> list[Category]:
+def parse_categories(data: Any, warnings: Optional[list[str]] = None) -> ParsedRecords[Category]:
     warnings = warnings if warnings is not None else []
-    return _parse_all(as_list(data), _category, "category", warnings)
+    return _parse_all(as_list(data), _category, "category", warnings, "category_id")
+
+
+def _tmdb_id(raw: RawRecord) -> Optional[str]:
+    """The provider's TMDB ID; ``0`` / ``"0"`` (and blanks) are the "none" placeholder."""
+    for key in ("tmdb", "tmdb_id"):
+        value = to_id(raw.get(key))
+        if value is not None and value != "0":
+            return value
+    return None
 
 
 # -- VOD ------------------------------------------------------------------------------------
-def _vod(raw: dict) -> Optional[VodStream]:
+def _vod(raw: RawRecord) -> Optional[VodStream]:
     sid = to_id(raw.get("stream_id"))
     if sid is None:
         return None
@@ -171,18 +289,18 @@ def _vod(raw: dict) -> Optional[VodStream]:
         release_date=release,
         rating=to_opt_str(raw.get("rating")),
         icon=to_opt_str(raw.get("stream_icon")),
-        tmdb_id=to_id(raw.get("tmdb") or raw.get("tmdb_id")) if (raw.get("tmdb") or raw.get("tmdb_id")) else None,
+        tmdb_id=_tmdb_id(raw),
         extra={k: v for k, v in raw.items() if k not in known and isinstance(v, (str, int, float))},
     )
 
 
-def parse_vod_streams(data: Any, warnings: Optional[list[str]] = None) -> list[VodStream]:
+def parse_vod_streams(data: Any, warnings: Optional[list[str]] = None) -> ParsedRecords[VodStream]:
     warnings = warnings if warnings is not None else []
-    return _parse_all(as_list(data), _vod, "movie", warnings)
+    return _parse_all(as_list(data), _vod, "movie", warnings, "stream_id")
 
 
 # -- series list -------------------------------------------------------------------------------
-def _series(raw: dict) -> Optional[SeriesEntry]:
+def _series(raw: RawRecord) -> Optional[SeriesEntry]:
     sid = to_id(raw.get("series_id"))
     if sid is None:
         return None
@@ -195,13 +313,13 @@ def _series(raw: dict) -> Optional[SeriesEntry]:
         release_date=to_opt_str(raw.get("releaseDate") or raw.get("release_date") or raw.get("releasedate")),
         cover=to_opt_str(raw.get("cover")),
         plot=to_opt_str(raw.get("plot")),
-        tmdb_id=to_id(raw.get("tmdb") or raw.get("tmdb_id")) if (raw.get("tmdb") or raw.get("tmdb_id")) else None,
+        tmdb_id=_tmdb_id(raw),
     )
 
 
-def parse_series_list(data: Any, warnings: Optional[list[str]] = None) -> list[SeriesEntry]:
+def parse_series_list(data: Any, warnings: Optional[list[str]] = None) -> ParsedRecords[SeriesEntry]:
     warnings = warnings if warnings is not None else []
-    return _parse_all(as_list(data), _series, "series", warnings)
+    return _parse_all(as_list(data), _series, "series", warnings, "series_id")
 
 
 # -- series info -------------------------------------------------------------------------------
@@ -216,7 +334,18 @@ def episode_numbers_from_title(title: str) -> tuple[Optional[int], Optional[int]
     return None, None
 
 
-def _episode(raw: dict, season_hint: Optional[int]) -> Optional[Episode]:
+def _episode(raw: RawRecord, season_hint: Optional[int]) -> Optional[Episode]:
+    """One episode, or None when it has no usable ID.
+
+    Contract:
+        Silences:
+            - The ID comes from ``id`` whenever that key is not None, even if it is
+              unusable (``""``); only an absent/null ``id`` falls back to ``episode_id``.
+            - ``season_hint`` (the episodes-dict key) overrides the record's ``season``.
+              A missing or negative season falls back to an ``SxxEyy`` in the title, then 1.
+            - A missing/negative ``episode_num`` falls back to the title (may stay None);
+              a non-positive duration becomes None.
+    """
     eid = to_id(raw.get("id") if raw.get("id") is not None else raw.get("episode_id"))
     if eid is None:
         return None
@@ -246,7 +375,7 @@ def _episode(raw: dict, season_hint: Optional[int]) -> Optional[Episode]:
     )
 
 
-def _iter_episode_groups(episodes: Any) -> Iterable[tuple[Optional[int], Any]]:
+def _iter_episode_groups(episodes: Any) -> Iterator[tuple[Optional[int], Any]]:
     """Yield (season_hint, raw_episode) for every known episodes layout."""
     if isinstance(episodes, dict):
         for key, value in episodes.items():
@@ -265,6 +394,17 @@ def _iter_episode_groups(episodes: Any) -> Iterable[tuple[Optional[int], Any]]:
 
 
 def parse_series_info(series_id: str, data: Any) -> SeriesDetails:
+    """Seasons and episodes from a ``get_series_info`` answer.
+
+    Contract:
+        Silences:
+            - Never raises for any JSON value. A non-object answer gives no episodes with
+              a warning; seasons without a non-negative ``season_number`` are dropped.
+            - Episodes: non-objects and ID-less records are skipped with a warning; any
+              ``Exception`` from ``_episode`` skips the record, and its ID (``id``, then
+              ``episode_id``) goes to ``unparsed_episode_ids`` when readable.
+            - An episode ID listed twice keeps its first occurrence only.
+    """
     details = SeriesDetails(series_id=series_id)
     if not isinstance(data, dict):
         # Some panels answer an empty list for series without episodes.
@@ -300,7 +440,13 @@ def parse_series_info(series_id: str, data: Any) -> SeriesDetails:
         try:
             episode = _episode(raw, hint)
         except Exception as exc:
-            details.warnings.append(f"Skipped malformed episode record #{index}: {exc}")
+            rid = _raw_id(raw, "id", "episode_id")
+            if rid is None:
+                details.warnings.append(f"Skipped malformed episode record #{index}: {exc}")
+            else:
+                # Still listed: the sync keeps the stored episode as it is (never "missing").
+                details.unparsed_episode_ids.add(rid)
+                details.warnings.append(f"Skipped malformed episode record #{index} (ID {rid}, kept as listed): {exc}")
             continue
         if episode is None:
             details.warnings.append(f"Skipped episode record #{index}: missing ID")
@@ -314,6 +460,14 @@ def parse_series_info(series_id: str, data: Any) -> SeriesDetails:
 
 # -- account ----------------------------------------------------------------------------------
 def parse_account(data: Any) -> AccountInfo:
+    """Account state from an authenticate answer.
+
+    Contract:
+        Silences:
+            - Never raises. A non-object or a missing ``user_info`` gives
+              ``authenticated=False`` with an explanatory message. Without an ``auth``
+              field, a ``status`` of "active" (any case) counts as authenticated.
+    """
     if not isinstance(data, dict):
         return AccountInfo(authenticated=False, message="Unexpected response from provider (not a JSON object)")
     user = as_dict(data.get("user_info"))

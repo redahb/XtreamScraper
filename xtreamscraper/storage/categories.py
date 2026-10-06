@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -25,7 +27,7 @@ class CategoryRecord:
     #: consecutive successful syncs that returned no items (see the sync engine's empty check)
     empty_syncs: int = 0
 
-    def public_dict(self) -> dict:
+    def public_dict(self) -> dict[str, str | bool]:
         return {
             "category_id": self.category_id,
             "name": self.name,
@@ -34,7 +36,7 @@ class CategoryRecord:
         }
 
 
-def _row(r) -> CategoryRecord:
+def _row(r: sqlite3.Row) -> CategoryRecord:
     return CategoryRecord(
         provider_id=r["provider_id"],
         content_type=r["content_type"],
@@ -48,10 +50,15 @@ def _row(r) -> CategoryRecord:
 
 
 class CategoryRepository:
+    # ``list`` below is a method name, so annotations in this class spell the type
+    # ``builtins.list`` (a bare ``list[...]`` would resolve to the method for type checkers).
+
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def list(self, provider_id: int, content_type: str) -> list[CategoryRecord]:
+    def list(self, provider_id: int, content_type: str) -> builtins.list[CategoryRecord]:
         rows = self.db.query(
             "SELECT * FROM categories WHERE provider_id = ? AND content_type = ? "
             "ORDER BY present DESC, name COLLATE NOCASE, category_id",
@@ -59,7 +66,7 @@ class CategoryRepository:
         )
         return [_row(r) for r in rows]
 
-    def selected(self, provider_id: int, content_type: str) -> list[CategoryRecord]:
+    def selected(self, provider_id: int, content_type: str) -> builtins.list[CategoryRecord]:
         return [c for c in self.list(provider_id, content_type) if c.selected]
 
     def replace_from_provider(self, provider_id: int, content_type: str, categories: Iterable[tuple[str, str]]) -> int:
@@ -67,6 +74,9 @@ class CategoryRepository:
 
         Categories no longer returned are kept (with ``present = 0``) so a temporary
         provider glitch never silently loses the user's selection.
+
+        Returns the number of distinct categories in the answer. A repeated ID keeps its first
+        name. An empty answer marks nothing absent (a glitch must not hide every category).
         """
         now = now_iso()
         seen: set[str] = set()
@@ -94,6 +104,12 @@ class CategoryRepository:
         return len(seen)
 
     def set_selection(self, provider_id: int, content_type: str, selected_ids: Iterable[str]) -> None:
+        """Select exactly ``selected_ids`` (as strings) and unselect the rest, in one transaction.
+
+        Contract:
+            Silences:
+                - IDs without a stored category are ignored, with no error or count.
+        """
         wanted = {str(c) for c in selected_ids}
         with self.db.transaction() as conn:
             conn.execute(

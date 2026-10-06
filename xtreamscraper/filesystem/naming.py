@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 from ..xtream.parsing import valid_year, year_from_date
 from .sanitize import DEFAULT_MAX_LENGTH, UNKNOWN, sanitize_component
@@ -34,8 +33,18 @@ _SPACES = re.compile(r"\s{2,}")
 _DANGLING = re.compile(r"(?:\s*[-–|]\s*)+$")
 
 
-def extract_year(name: Optional[str]) -> Optional[int]:
-    """Year stated at the end of a title: ``Movie (1999)``, ``Movie [1999]`` or ``Movie - 1999``."""
+def extract_year(name: str | None) -> int | None:
+    """Year stated at the end of a title: ``Movie (1999)``, ``Movie [1999]`` or ``Movie - 1999``.
+
+    Provider tags are removed first, so ``Movie (1999) 4K`` also gives 1999.
+
+    Contract:
+        Silences:
+            - A trailing 19xx/20xx number outside ``valid_year`` (before 1900, or more than
+              five years after the current year) gives ``None``, although ``clean_title``
+              still strips it from the title (``Blade Runner - 2049``). The answer depends on
+              today's date.
+    """
     if not name:
         return None
     stripped = _strip_tags(name)
@@ -58,7 +67,7 @@ def _strip_tags(name: str) -> str:
     return _SPACES.sub(" ", text).strip()
 
 
-def version_label(name: Optional[str]) -> Optional[str]:
+def version_label(name: str | None) -> str | None:
     """Quality/codec/source tags in a title (``4K HEVC``) – used to tell variants apart."""
     if not name:
         return None
@@ -72,8 +81,25 @@ def version_label(name: Optional[str]) -> Optional[str]:
     return " ".join(seen) or None
 
 
-def clean_title(name: Optional[str], enabled: bool = True) -> str:
-    """Display title without provider decorations and without a trailing year."""
+def clean_title(name: str | None, enabled: bool = True) -> str:
+    """Display title without provider decorations and without a trailing year.
+
+    With ``enabled`` false only quote repair, the trailing year and dangling separators are
+    handled.
+
+    Contract:
+        Silences:
+            - Not idempotent: one trailing year is removed per pattern, so
+              ``Movie (2001) (2002)`` gives ``Movie (2001)`` and cleaning that again gives
+              ``Movie``.
+            - Any trailing ``(19xx)``/``(20xx)`` or ``- 19xx``/``- 20xx`` is removed, even one
+              that ``extract_year`` rejects (``Blade Runner - 2049`` gives ``Blade Runner``),
+              unless that would leave nothing.
+            - Any bracketed 2-3 letter word counts as a language tag (``[REC] 2`` gives ``2``).
+              If removing the tags leaves nothing, the untagged text is kept instead.
+            - The result can be ``""`` for non-blank input made only of separators (``-``);
+              callers substitute a fallback.
+    """
     text = (name or "").strip()
     if not text:
         return ""
@@ -89,8 +115,14 @@ def clean_title(name: Optional[str], enabled: bool = True) -> str:
     return _SPACES.sub(" ", text).strip()
 
 
-def resolve_year(name: Optional[str], explicit_year: object = None, release_date: object = None) -> Optional[int]:
-    """Year from the title, else an explicit provider year, else a release date. Never guessed."""
+def resolve_year(name: str | None, explicit_year: object = None, release_date: object = None) -> int | None:
+    """Year from the title, else an explicit provider year, else a release date. Never guessed.
+
+    Contract:
+        Silences:
+            - Unparseable or out-of-range values of each source fall through to the next one
+              and finally to ``None``; the caller cannot tell which source was used.
+    """
     return extract_year(name) or valid_year(explicit_year) or year_from_date(release_date)
 
 
@@ -101,11 +133,21 @@ class NameRules:
     episode_title_in_filename: bool = False
 
 
-def title_with_year(title: str, year: Optional[int]) -> str:
+def title_with_year(title: str, year: int | None) -> str:
     return f"{title} ({year})" if year else title
 
 
-def movie_base_name(raw_name: str, year: Optional[int], rules: NameRules = NameRules()) -> str:
+def movie_base_name(raw_name: str, year: int | None, rules: NameRules = NameRules()) -> str:
+    """``Title (Year)`` folder/file stem for a movie, sanitized and at most ``rules.max_length``.
+
+    Contract:
+        Preconditions:
+            - ``raw_name`` is cleaned here with ``clean_title``. The sync engine passes an
+              already cleaned title, so it is cleaned twice (``clean_title`` is not
+              idempotent; see there).
+            - The title part is capped at ``max(20, max_length - 20)`` characters to leave
+              room for the year and a collision suffix.
+    """
     title = clean_title(raw_name, rules.clean_titles) or UNKNOWN
     # Leave room for " (YYYY)" and a possible collision suffix.
     safe_title = sanitize_component(title, max_length=max(20, rules.max_length - 20))
@@ -117,7 +159,7 @@ def series_display_title(raw_name: str, rules: NameRules = NameRules()) -> str:
     return sanitize_component(title, max_length=max(20, rules.max_length - 40))
 
 
-def series_base_name(raw_name: str, year: Optional[int], rules: NameRules = NameRules()) -> str:
+def series_base_name(raw_name: str, year: int | None, rules: NameRules = NameRules()) -> str:
     return sanitize_component(title_with_year(series_display_title(raw_name, rules), year), max_length=rules.max_length)
 
 
@@ -126,14 +168,14 @@ def season_folder_name(season: int) -> str:
     return f"Season {max(0, int(season)):02d}"
 
 
-def episode_code(season: int, episode: Optional[int]) -> str:
+def episode_code(season: int, episode: int | None) -> str:
     return f"S{max(0, season):02d}E{max(0, episode or 0):02d}"
 
 
 def episode_base_name(
     series_title: str,
     season: int,
-    episode: Optional[int],
+    episode: int | None,
     episode_title: str = "",
     rules: NameRules = NameRules(),
 ) -> str:
@@ -146,8 +188,21 @@ def episode_base_name(
     return sanitize_component(base, max_length=rules.max_length)
 
 
-def trustworthy_episode_title(series_title: str, season: int, episode: Optional[int], title: str) -> str:
-    """The episode's own title, or '' if it is only a restatement of show/number."""
+def trustworthy_episode_title(series_title: str, season: int, episode: int | None, title: str) -> str:
+    """The episode's own title, or '' if it is only a restatement of show/number.
+
+    Everything up to the episode code (``S01E02``) is dropped, then a leading series title,
+    then separators. What is left is used unless it is empty or a bare episode number
+    (``Episode 2``). The result is sanitized and at most 60 characters.
+
+    Contract:
+        Silences:
+            - The series title is removed as a plain prefix with no word boundary: series
+              ``Show`` and title ``Showdown`` give ``down``.
+            - The code is searched in ``title.upper()`` but cut from the original text; when
+              upper-casing changes the length before the code (``ß`` becomes ``SS``), the cut
+              lands too far and eats characters (``Straße der Straße S01E02 Pilot`` gives ``ilot``).
+    """
     text = clean_title(title, True)
     if not text:
         return ""

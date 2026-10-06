@@ -87,15 +87,24 @@ class MatchOutcome:
 
     @classmethod
     def error(cls, message: str) -> "MatchOutcome":
+        """The source could not answer (network, rate limit, rejected key...): nothing is concluded."""
         return cls(MatchStatus.API_ERROR, message=message)
 
     @classmethod
     def provider_format_error(cls, message: str) -> "MatchOutcome":
+        """The source answered in a format the plugin no longer understands (``API_ERROR`` +
+        ``format_error``); never use ``unmatched`` for this."""
         return cls(MatchStatus.API_ERROR, message=message, format_error=True)
 
     @classmethod
     def from_decision(cls, decision: "MatchDecision", method: MatchMethod, max_candidates: int = 5) -> "MatchOutcome":
-        """Translate a shared-matcher decision (see ``xtreamscraper.core.matching``)."""
+        """Translate a shared-matcher decision (see ``xtreamscraper.core.matching``).
+
+        Contract:
+            Preconditions:
+                - ``decision.ranked`` is in the matcher's order; the first ``max_candidates``
+                  become the diagnostic candidates (also on a match).
+        """
         candidates = [Candidate(str(s.candidate.remote_id), s.matched_title, s.candidate.year, s.score)
                       for s in decision.ranked[:max_candidates]]
         if decision.matched and decision.best is not None:
@@ -126,10 +135,13 @@ class FetchOutcome:
 
     @classmethod
     def not_found(cls, message: Optional[str] = None) -> "FetchOutcome":
+        """Definitive: the remote item does not exist (or is not of the requested kind). This
+        ends the item's binding, a manual one included, so never use it for a failed request."""
         return cls(FetchStatus.NOT_FOUND, message=message)
 
     @classmethod
     def error(cls, message: str) -> "FetchOutcome":
+        """Transient or configuration trouble; the binding (manual or not) is kept."""
         return cls(FetchStatus.API_ERROR, message=message)
 
     @classmethod

@@ -11,20 +11,24 @@ hash recorded at the application's last write was changed by someone else: it is
 from __future__ import annotations
 
 import os
+import sqlite3
 from dataclasses import dataclass
 from typing import Optional
 
 from ..utils.timeutil import now_iso
+from .artwork import ItemKey  # (provider_id, item_kind, category_id, item_id): one key for both tables
 from .db import Database
-
-#: (provider_id, item_kind, category_id, item_id), the same key the artwork tables use.
-ItemKey = tuple[int, str, str, str]
 
 MANAGED = "managed"
 MODIFIED = "modified"
 
 
 def path_key(path: str) -> str:
+    """The stored form of an NFO path: absolute, case and separators as given.
+
+    No ``normcase``: rows store this exact spelling, so a different normalisation would
+    silently disown every stored NFO.
+    """
     return os.path.abspath(path)
 
 
@@ -46,11 +50,13 @@ class NfoFileRecord:
         return (self.provider_id, self.item_kind, self.category_id, self.item_id)
 
 
-def _record(row) -> NfoFileRecord:
+def _record(row: sqlite3.Row) -> NfoFileRecord:
     return NfoFileRecord(**{k: row[k] for k in row.keys()})
 
 
 class NfoFileRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -59,7 +65,18 @@ class NfoFileRepository:
         return _record(row) if row else None
 
     def register(self, path: str, nfo_kind: str, key: ItemKey, file_hash: str) -> None:
-        """The application just created ``path``: it owns it from now on."""
+        """The application just created ``path``: it owns it from now on.
+
+        Contract:
+            Preconditions:
+                - Only for a file this call's write created. On an existing row the row is
+                  replaced: status goes back to ``managed`` (also from ``modified``), and the
+                  item key, hash and ``created_at`` are overwritten. Callers keep "modified for
+                  good" by registering only when the file did not exist
+                  (:class:`..nfo.service.NfoOwner` ``created=True``).
+                - ``provider_id`` in ``key`` must exist (foreign key, else
+                  ``sqlite3.IntegrityError``).
+        """
         now = now_iso()
         with self.db.transaction() as conn:
             conn.execute(
@@ -73,10 +90,13 @@ class NfoFileRepository:
             )
 
     def set_hash(self, path: str, file_hash: str) -> None:
+        """Record the hash of the application's latest write; a ``modified`` (or unknown) NFO is
+        left as is, silently."""
         self.db.execute("UPDATE nfo_files SET file_hash = ?, updated_at = ? WHERE nfo_path = ? AND status = ?",
                         (file_hash, now_iso(), path_key(path), MANAGED))
 
     def mark_modified(self, path: str) -> None:
+        """The NFO was changed by someone else: never delete it (no-op for an unknown path)."""
         self.db.execute("UPDATE nfo_files SET status = ?, updated_at = ? WHERE nfo_path = ?",
                         (MODIFIED, now_iso(), path_key(path)))
 
@@ -90,7 +110,13 @@ class NfoFileRepository:
         self.db.execute("DELETE FROM nfo_files WHERE nfo_path = ?", (path_key(path),))
 
     def move(self, old_path: str, new_path: str) -> None:
-        """A sidecar rename moved an NFO (episode renamed)."""
+        """A sidecar rename moved an NFO (episode renamed).
+
+        Contract:
+            Silences:
+                - A row already stored at ``new_path`` is deleted first (the moved file
+                  replaced it). Moving an unknown path does nothing.
+        """
         old, new = path_key(old_path), path_key(new_path)
         if old == new:
             return
@@ -99,7 +125,12 @@ class NfoFileRepository:
             conn.execute("UPDATE nfo_files SET nfo_path = ? WHERE nfo_path = ?", (new, old))
 
     def move_folder(self, provider_id: int, old_folder: str, new_folder: str) -> None:
-        """An item folder was moved (movie or series renamed): every NFO below it moves along."""
+        """An item folder was moved (movie or series renamed): every NFO below it moves along.
+
+        Only paths under ``old_folder`` + separator move (``/A`` never takes ``/AB/...``);
+        rows of other providers are not touched. A row already stored at a target path is
+        replaced, as in :meth:`move`.
+        """
         old, new = path_key(old_folder).rstrip(os.sep), path_key(new_folder).rstrip(os.sep)
         if old == new:
             return

@@ -16,21 +16,27 @@ from typing import Optional
 from ..config.settings import Settings
 from ..jobs.progress import JobCancelled, JobProgress
 from ..library.index import LibraryIndex
-from ..library.models import EPISODE, MOVIE
+from ..library.models import EPISODE, MOVIE, LibrarySeries
 from ..storage.db import Database
 from .download import ArtworkDownloader
 from .manager import ArtworkManager, ArtworkStats
+from ..storage.artwork import ItemKey
 from .naming import ArtworkTarget
 
 log = logging.getLogger(__name__)
 
 
-def library_targets(db: Database, provider_id: int) -> dict[tuple, ArtworkTarget]:
-    """Current artwork targets of a provider's active library items, by stable item key."""
+def library_targets(db: Database, provider_id: int) -> dict[ItemKey, ArtworkTarget]:
+    """Current artwork targets of a provider's active library items, by stable item key.
+
+    A season is a target only while it has an active episode and its show is active; its
+    folder is that of the first episode found.
+    """
     index = LibraryIndex(db)
-    targets: dict[tuple, ArtworkTarget] = {}
-    shows = {(s.category_id, s.series_id): s for s in index.series(provider_id)}
-    season_folders: dict[tuple, str] = {}
+    targets: dict[ItemKey, ArtworkTarget] = {}
+    shows: dict[tuple[str, Optional[str]], LibrarySeries] = {
+        (s.category_id, s.series_id): s for s in index.series(provider_id)}
+    season_folders: dict[tuple[str, Optional[str], int], str] = {}
     for item in index.items(provider_id, kinds=(MOVIE, EPISODE)):
         target = ArtworkTarget.for_movie(item) if item.kind == MOVIE else ArtworkTarget.for_episode(item)
         targets[target.key] = target
@@ -40,9 +46,9 @@ def library_targets(db: Database, provider_id: int) -> dict[tuple, ArtworkTarget
         target = ArtworkTarget.for_series(show)
         targets[target.key] = target
     for (category_id, series_id, season), folder in season_folders.items():
-        show = shows.get((category_id, series_id))
-        if show is not None:
-            target = ArtworkTarget.for_season(show, folder, season)
+        parent = shows.get((category_id, series_id))
+        if parent is not None:
+            target = ArtworkTarget.for_season(parent, folder, season)
             targets[target.key] = target
     return targets
 
@@ -57,6 +63,17 @@ class ArtworkReconciler:
         self.manager = ArtworkManager(db, settings, library_root, downloader=downloader, stats=self.stats)
 
     def run(self, provider_id: int, label: str = "", force: bool = False) -> tuple[str, ArtworkStats]:
+        """Reconcile every item of ``provider_id`` that has stored artwork selections.
+
+        Returns ``(status, stats)``: ``success``, ``partial`` (finished with errors),
+        ``cancelled`` or ``failed``.
+
+        Contract:
+            Silences:
+                - ``JobCancelled`` gives ``cancelled`` (with a warning); any other
+                  ``Exception`` gives ``failed``, with its message in ``stats.errors`` and a
+                  logged traceback. The manager's own downloader is always closed.
+        """
         status = "success"
         log.info("Artwork reconciliation started: %s (mode %s%s)", label, self.settings.artwork_mode,
                  ", force replace" if force else "")
@@ -81,9 +98,21 @@ class ArtworkReconciler:
         return status, self.stats
 
     def _run(self, provider_id: int, force: bool) -> None:
+        """Process the stored items in kind order (movies, series, seasons, episodes).
+
+        Contract:
+            Raises:
+                JobCancelled: From the progress between items.
+
+            Silences:
+                - Items no longer active in the library are counted as skipped and left
+                  alone; keys of any other kind than the four above are dropped uncounted.
+                - Any ``Exception`` for one item: a ``stats.errors`` entry, logged; the job
+                  goes on. At most three new messages per item reach the job progress.
+        """
         targets = library_targets(self.db, provider_id)
         keys = self.manager.repo.item_keys(provider_id)
-        by_kind: dict[str, list] = defaultdict(list)
+        by_kind: dict[str, list[ItemKey]] = defaultdict(list)
         for key in keys:
             by_kind[key[1]].append(key)
         ordered = [k for kind in ("movie", "series", "season", "episode") for k in sorted(by_kind.get(kind, []))]
@@ -98,13 +127,17 @@ class ArtworkReconciler:
                 continue
             self.progress.update(current_item=target.label)
             errors_before = self.stats.errors_count
+            messages_before = len(self.stats.errors)  # the message list is capped, the count is not
             try:
                 self.manager.process(target, force=force)
             except Exception as exc:
                 self.stats.error(f"{target.label}: {exc}")
                 log.exception("Artwork reconciliation failed for %s", target.label)
-            if self.stats.errors_count > errors_before:
-                for message in self.stats.errors[errors_before:][-3:]:
+            new_errors = self.stats.errors_count - errors_before
+            if new_errors:
+                messages = self.stats.errors[messages_before:][-3:] \
+                    or [f"{target.label}: {new_errors} more artwork error(s)"]
+                for message in messages:
                     self.progress.error(message)
             self.progress.advance()
             self.progress.update(summary=self.stats.summary())

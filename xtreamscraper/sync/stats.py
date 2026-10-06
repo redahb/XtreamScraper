@@ -43,15 +43,20 @@ class SyncStats:
     files_recreated: int = 0
     items_relocated: int = 0
     name_collisions: int = 0
+    errors_count: int = 0  # every error, also those beyond the capped ``errors`` list
     categories: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def warn(self, message: str) -> None:
+        """Record a redacted warning. Beyond ``MAX_MESSAGES`` further warnings are dropped silently."""
         if len(self.warnings) < MAX_MESSAGES:
             self.warnings.append(redact(message))
 
     def error(self, message: str) -> None:
+        """Record a redacted error. Beyond ``MAX_MESSAGES`` further errors are dropped silently
+        (``run`` still reports ``partial``: the list is not empty); ``errors_count`` counts them all."""
+        self.errors_count += 1
         if len(self.errors) < MAX_MESSAGES:
             self.errors.append(redact(message))
 
@@ -72,7 +77,8 @@ class SyncStats:
         return self.movies_missing + self.series_missing + self.episodes_missing
 
     def counters(self) -> dict[str, int]:
-        return {k: v for k, v in asdict(self).items() if isinstance(v, int)}
+        """The integer figures stored with the history row (``errors_count`` is not one of them)."""
+        return {k: v for k, v in asdict(self).items() if isinstance(v, int) and k != "errors_count"}
 
     def summary(self) -> dict[str, int]:
         return {"created": self.created, "updated": self.updated, "skipped": self.unchanged, "missing": self.missing}

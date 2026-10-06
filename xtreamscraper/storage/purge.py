@@ -7,10 +7,14 @@ history tables are never touched; history stays historical.
 
 from __future__ import annotations
 
+import sqlite3
+from typing import Sequence
+
 from .db import Database
 
 
-def _forget_artwork(conn, provider_id: int, item_kind: str, category_id: str, item_ids: list[str]) -> None:
+def _forget_artwork(conn: sqlite3.Connection, provider_id: int, item_kind: str, category_id: str,
+                    item_ids: Sequence[str]) -> None:
     for item_id in item_ids:
         key = (provider_id, item_kind, category_id, item_id)
         # artwork_files / artwork_nfo_refs go with their slot (ON DELETE CASCADE)
@@ -25,11 +29,17 @@ def _forget_artwork(conn, provider_id: int, item_kind: str, category_id: str, it
 
 
 class PurgeRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
     def season_ids(self, provider_id: int, category_id: str, series_id: str) -> list[str]:
-        """Season item IDs (``<series_id>/<season>``) the series has any state for."""
+        """Season item IDs (``<series_id>/<season>``) the series has any state for.
+
+        Matches on the exact ``<series_id>/`` prefix, so series ``12`` never picks up the
+        seasons of series ``123``. Sorted, without duplicates.
+        """
         prefix = f"{series_id}/"
         ids: set[str] = set()
         for table in ("artwork_slots", "artwork_items", "scraper_bindings", "nfo_files"):
@@ -42,6 +52,17 @@ class PurgeRepository:
         return sorted(ids)
 
     def purge_movie(self, provider_id: int, category_id: str, stream_id: str) -> None:
+        """Forget the movie: its artwork slots (with their file and NFO-reference rows), bindings,
+        NFO ownership rows, probe state and the movie row, in one transaction.
+
+        Contract:
+            Preconditions:
+                - The caller has already deleted (or decided to keep) the files these rows
+                  prove ownership of; afterwards nothing records that the application owned
+                  them. Idempotent: purging an unknown item does nothing.
+            Raises:
+                sqlite3.Error: Nothing is removed then (one transaction).
+        """
         with self.db.transaction() as conn:
             _forget_artwork(conn, provider_id, "movie", category_id, [stream_id])
             conn.execute("DELETE FROM probe_state WHERE provider_id = ? AND content_type = 'movie' "
@@ -49,7 +70,9 @@ class PurgeRepository:
             conn.execute("DELETE FROM movies WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
                          (provider_id, category_id, stream_id))
 
-    def purge_episodes(self, provider_id: int, category_id: str, series_id: str, episode_ids: list[str]) -> None:
+    def purge_episodes(self, provider_id: int, category_id: str, series_id: str, episode_ids: Sequence[str]) -> None:
+        """Forget these episodes like :meth:`purge_movie`, all in one transaction (joins the
+        caller's transaction when nested)."""
         with self.db.transaction() as conn:
             _forget_artwork(conn, provider_id, "episode", category_id, episode_ids)
             for episode_id in episode_ids:
@@ -59,7 +82,15 @@ class PurgeRepository:
                              "AND episode_id = ?", (provider_id, category_id, series_id, episode_id))
 
     def purge_series(self, provider_id: int, category_id: str, series_id: str) -> None:
-        """The series, its seasons and every episode it still has."""
+        """The series, its seasons and every episode it still has.
+
+        Contract:
+            Preconditions:
+                - As :meth:`purge_movie`. The episode and season IDs are read before the
+                  transaction starts; an episode added by another thread in between stays.
+            Raises:
+                sqlite3.Error: The whole series purge is rolled back (episodes included).
+        """
         episode_ids = [r["episode_id"] for r in self.db.query(
             "SELECT episode_id FROM episodes WHERE provider_id = ? AND category_id = ? AND series_id = ?",
             (provider_id, category_id, series_id))]

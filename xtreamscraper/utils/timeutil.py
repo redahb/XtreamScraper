@@ -21,8 +21,18 @@ def to_iso(value: datetime) -> str:
 
 
 def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    """An aware datetime from ISO-8601 text; a value without a zone is taken as UTC.
+
+    Contract:
+        Silences:
+            - Empty, unparseable or non-string values give ``None`` (``TypeError`` and
+              ``ValueError`` from ``fromisoformat`` are caught). Callers such as
+              :func:`older_than` treat ``None`` as "very old".
+    """
     if not value:
         return None
+    if isinstance(value, str) and value.endswith("Z"):
+        value = value[:-1] + "+00:00"  # Python 3.10's fromisoformat rejects "Z"; 3.11+ accepts it
     try:
         parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):

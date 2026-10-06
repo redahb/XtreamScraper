@@ -85,7 +85,6 @@ class ConfigField:
     minimum: Optional[float] = None
     maximum: Optional[float] = None
     choices: list[tuple[str, str]] = field(default_factory=list)  # (value, label)
-    pattern_hint: str = ""
     advanced: bool = False  # shown in the page's "Advanced" section
 
     def public_dict(self) -> dict[str, Any]:
@@ -106,8 +105,32 @@ class Attribution:
     url: Optional[str] = None
 
 
+def _check_bounds(f: ConfigField, value: float) -> None:
+    """Raise :class:`ConfigError` when ``value`` is outside the field's (optional) bounds."""
+    low, high = f.minimum, f.maximum
+    if (low is None or value >= low) and (high is None or value <= high):
+        return
+    if low is not None and high is not None:
+        raise ConfigError(f"{f.label} must be between {low:g} and {high:g}")
+    if low is not None:
+        raise ConfigError(f"{f.label} must be at least {low:g}")
+    raise ConfigError(f"{f.label} must be at most {high:g}")
+
+
 def validate_against_schema(schema: list[ConfigField], values: dict[str, Any]) -> dict[str, Any]:
-    """Type-check and bound-check ``values``; returns a complete, cleaned config dict."""
+    """Type-check and bound-check ``values``; returns a complete, cleaned config dict.
+
+    Contract:
+        Raises:
+            ConfigError: An ``INTEGER`` that is not a whole number (also ``"3.5"`` and ``True``)
+                or out of bounds; a ``SELECT`` value not among its choices.
+        Silences:
+            - ``BOOLEAN``: any non-bool is read as text, so only ``1/true/yes/on`` are True
+              and everything else (also ``None``) is False.
+            - ``STRING`` / ``SECRET`` / ``SELECT``: any value is turned into stripped text
+              (a dict or list too); ``None`` becomes ``""``.
+            - Keys not in ``schema`` are dropped; required fields are not checked here.
+    """
     clean: dict[str, Any] = {}
     for f in schema:
         raw = values.get(f.key, f.default)
@@ -121,8 +144,7 @@ def validate_against_schema(schema: list[ConfigField], values: dict[str, Any]) -
                     value = int(str(raw).strip())
                 except ValueError:
                     raise ConfigError(f"{f.label} must be a whole number") from None
-                if f.minimum is not None and value < f.minimum or f.maximum is not None and value > f.maximum:
-                    raise ConfigError(f"{f.label} must be between {f.minimum:g} and {f.maximum:g}")
+                _check_bounds(f, value)
         else:
             value = "" if raw is None else str(raw).strip()
             if f.type is FieldType.SELECT and value and f.choices and value not in {c for c, _ in f.choices}:
@@ -158,7 +180,31 @@ TestResult = Union[tuple[bool, str], tuple[bool, str, dict[str, Any]]]
 
 
 class ScraperSession(abc.ABC):
-    """Per-job worker. Default implementations report the operation as unsupported."""
+    """Per-job worker. Default implementations report the operation as unsupported.
+
+    Outcome contract (the core acts on the status, so choose it carefully):
+
+    * ``match_*`` returns a :class:`~.results.MatchOutcome`: ``matched`` (with the remote
+      ID), ``unmatched``, ``ambiguous`` (both keep searching with the next plugin and are
+      retried on the next job) or ``error`` (``API_ERROR``: the source could not answer;
+      nothing is concluded about the item).
+    * ``get_*`` returns a :class:`~.results.FetchOutcome`:
+
+      - ``ok``: the metadata.
+      - ``not_found``: definitive, the source says this remote ID does not exist (or is not
+        of the requested kind). It **ends the binding, manual bindings included**, so use
+        it only for a real "does not exist" answer, never for a failed request.
+      - ``error``: transient or configuration trouble (network, timeout, rate limit,
+        rejected key). The binding, manual or not, is kept and retried later.
+      - ``provider_format_error``: the source answered in a format the plugin no longer
+        understands. Reported as ``API_ERROR`` with ``format_error`` set; the binding is
+        kept, so a fixed plugin picks the item up again. Never use ``not_found`` for this.
+      - ``unsupported``: the plugin does not offer this operation.
+
+    The same rules apply to ``MatchOutcome.error`` / ``MatchOutcome.provider_format_error``.
+    Methods should return outcomes instead of raising; an unexpected exception is treated
+    like ``error``.
+    """
 
     #: Set by a session that must not be called again during this job (e.g. the source's
     #: request quota is exhausted or its credentials were rejected). The message is safe
@@ -167,21 +213,31 @@ class ScraperSession(abc.ABC):
     suspended: Optional[str] = None
 
     def match_movie(self, query: MatchQuery) -> MatchOutcome:
+        """Find the remote movie for ``query`` (see the outcome contract in the class docstring)."""
         return MatchOutcome(MatchStatus.UNSUPPORTED)
 
     def get_movie(self, remote_id: str) -> FetchOutcome:
+        """Movie metadata for ``remote_id``. ``not_found`` ends the binding; ``error`` and
+        ``provider_format_error`` keep it."""
         return FetchOutcome.unsupported()
 
     def match_series(self, query: MatchQuery) -> MatchOutcome:
+        """Find the remote series for ``query`` (see the outcome contract in the class docstring)."""
         return MatchOutcome(MatchStatus.UNSUPPORTED)
 
     def get_series(self, remote_id: str) -> FetchOutcome:
+        """Series metadata for ``remote_id``. ``not_found`` ends the binding; ``error`` and
+        ``provider_format_error`` keep it."""
         return FetchOutcome.unsupported()
 
     def get_season(self, series_remote_id: str, season_number: int) -> FetchOutcome:
+        """Season metadata of the matched series. ``not_found`` = the source does not list this
+        season; ``error`` / ``provider_format_error`` = nothing is known."""
         return FetchOutcome.unsupported()
 
     def get_episode(self, series_remote_id: str, season_number: int, episode_number: int) -> FetchOutcome:
+        """Episode metadata of the matched series. ``not_found`` only when the source really does
+        not list this season/episode; never map another season's or episode's data."""
         return FetchOutcome.unsupported()
 
     def resolve_manual_id(self, media_type: str, namespace: str, value: str) -> ResolveOutcome:

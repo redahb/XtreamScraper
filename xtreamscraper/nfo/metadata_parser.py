@@ -38,17 +38,23 @@ def _text(root: ET.Element, tag: str) -> Optional[str]:
 
 
 def _int(value: Optional[str]) -> Optional[int]:
-    try:
-        number = int(float(value)) if value not in (None, "") else None
-    except (TypeError, ValueError):
+    if value is None or value == "":
         return None
-    return number if number is not None and number >= 0 else None
+    try:
+        number = int(float(value))
+    except ValueError:  # not a number (also "nan")
+        return None
+    except OverflowError:  # "inf", "1e400"
+        return None
+    return number if number >= 0 else None
 
 
 def _float(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
     try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
+        return float(value)
+    except ValueError:
         return None
 
 
@@ -95,6 +101,17 @@ def _artwork(root: ET.Element, kind: NfoKind) -> Optional[list[Artwork]]:
 
 
 def parse_metadata(source: Union[NfoDocument, ET.Element], kind: Optional[NfoKind] = None) -> MetadataResult:
+    """The descriptive metadata of an NFO, the protected starting point of a scrape.
+
+    Contract:
+        Preconditions:
+            - ``kind`` defaults to the document's kind, then to movie (for a bare element
+              always movie unless given): a wrong kind reads the wrong date/number tags.
+        Silences:
+            - Malformed, negative or overflowing numbers become ``None``; ratings that are not
+              positive are skipped; for a repeated ``uniqueid`` type or rating name the first
+              one wins. ID types and rating names are lower-cased.
+    """
     root = source.root if isinstance(source, NfoDocument) else source
     kind = kind or (source.kind if isinstance(source, NfoDocument) else None) or NfoKind.MOVIE
     result = MetadataResult(media_type=KIND_TO_MEDIA[kind])
@@ -130,10 +147,10 @@ def parse_metadata(source: Union[NfoDocument, ET.Element], kind: Optional[NfoKin
 
     for el in root.findall("ratings/rating"):
         name = (el.get("name") or "").strip().lower()
-        value = _float(_text(el, "value"))
-        if not name or value is None or value <= 0:
+        rating = _float(_text(el, "value"))
+        if not name or rating is None or rating <= 0:
             continue
-        result.ratings.setdefault(name, Rating(value=value, votes=_int(_text(el, "votes")),
+        result.ratings.setdefault(name, Rating(value=rating, votes=_int(_text(el, "votes")),
                                                max_value=_float(el.get("max")) or 10.0))
         if (el.get("default") or "").lower() == "true" and result.default_rating is None:
             result.default_rating = name

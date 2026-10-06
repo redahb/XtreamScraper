@@ -8,10 +8,12 @@ the result is merged into the item's NFO ``<fileinfo>`` through the shared NFO s
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from ..config.settings import Settings
 from ..filesystem import atomic
@@ -35,15 +37,17 @@ from ..storage.probe_state import (
 )
 from ..utils.hashing import url_fingerprint
 from ..utils.redact import redact
-from ..utils.timeutil import now_iso
+from ..utils.timeutil import now_iso, parse_iso
 from .ffprobe_mapper import map_ffprobe
 from .ffprobe_runner import ProbeError, ProbeOptions, run_ffprobe
 from .policy import ProbePolicy, needs_probe
 
 log = logging.getLogger(__name__)
 
-Runner = Callable[[str, str, ProbeOptions], dict]
+Runner = Callable[[str, str, ProbeOptions], dict[str, Any]]
 MAX_MESSAGES = 500
+# File systems with coarse timestamps (FAT: 2 s) must not make an edited .strm look older.
+MTIME_SLACK_SECONDS = 2.0
 
 
 @dataclass
@@ -130,6 +134,17 @@ class ProbeEngine:
 
     # -- entry point ---------------------------------------------------------------------------
     def run(self, request: ProbeRequest, provider_label: str = "") -> tuple[str, ProbeStats]:
+        """Probe the requested items; returns ``(status, stats)``.
+
+        Status is ``success``, ``partial`` (errors, failed probes or invalid ``.strm``),
+        ``cancelled`` or ``failed``.
+
+        Contract:
+            Silences:
+                - Every ``Exception`` (not ``KeyboardInterrupt``) becomes status ``failed`` with
+                  a redacted error in ``stats`` and a logged traceback; items processed before
+                  it keep their saved state.
+        """
         log.info("Probe started: %s (%s%s)", provider_label or "all providers", request.scope,
                  ", forced" if request.force else "")
         status = "success"
@@ -180,12 +195,12 @@ class ProbeEngine:
                 self.progress.advance()
             return
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probe") as pool:
-            pending: set[Future] = set()
+            pending: set[Future[None]] = set()
             queue = iter(todo)
             for item, url, record in queue:
                 if self.progress.cancelled:
                     break
-                pending.add(pool.submit(self._probe_item, item, url, record))
+                pending.add(pool.submit(self._worker_task, item, url, record))
                 if len(pending) >= workers * 2:
                     done, pending = wait(pending, return_when=FIRST_COMPLETED)
                     self._collect(done)
@@ -193,7 +208,14 @@ class ProbeEngine:
             self._collect(done)
         self.progress.check_cancelled()
 
-    def _collect(self, futures) -> None:
+    def _worker_task(self, item: LibraryItem, url: str, record: Optional[ProbeRecord]) -> None:
+        """One pool task: probe the item, then close this worker thread's DB connection."""
+        try:
+            self._probe_item(item, url, record)
+        finally:
+            self.db.release_thread()
+
+    def _collect(self, futures: Iterable[Future[None]]) -> None:
         for future in futures:
             self.progress.advance()
             exc = future.exception()
@@ -202,11 +224,28 @@ class ProbeEngine:
 
     # -- per item --------------------------------------------------------------------------------
     def _prepare(self, item: LibraryItem, record: Optional[ProbeRecord], force: bool) -> Optional[str]:
-        """Return the URL to probe, or None when the item is skipped."""
-        if not atomic.is_file(item.strm_path):
+        """Return the URL to probe, or None when the item is skipped.
+
+        Contract:
+            Silences:
+                - A missing or non-regular ``.strm`` is counted and warned about, not
+                  failed; its probe state is left as is.
+                - An unusable URL is saved as ``invalid_strm`` (keeping the stored media info).
+        """
+        try:
+            info = os.stat(atomic.fs_path(item.strm_path))
+        except OSError:
+            info = None
+        if info is None or not stat.S_ISREG(info.st_mode):
             self.stats.missing_files += 1
             self.stats.warn(f"{item.label}: STRM file not found ({item.strm_path}); run a sync to recreate it")
             return None
+        if not force and self._unchanged_since_probe(item, record, info.st_mtime):
+            assert record is not None and record.url_hash is not None
+            should, reason = needs_probe(record, record.url_hash, self.policy, force)
+            if not should:
+                self.stats.skipped_unchanged += 1
+                return None
         url = read_strm_url(item.strm_path)
         if not is_usable_url(url):
             self.stats.invalid_strm += 1
@@ -223,7 +262,29 @@ class ProbeEngine:
             return None
         return url
 
+    @staticmethod
+    def _unchanged_since_probe(item: LibraryItem, record: Optional[ProbeRecord], mtime: float) -> bool:
+        """True when the ``.strm`` provably still holds the URL of the last successful probe.
+
+        The sync wrote the URL the probe used (same fingerprint) and the file was not touched
+        after that probe, so reading it again cannot change the decision.
+        """
+        if record is None or record.status != STATUS_OK or not record.url_hash or item.url_hash != record.url_hash:
+            return False
+        probed = parse_iso(record.last_attempt_at)
+        return probed is not None and mtime < probed.timestamp() - MTIME_SLACK_SECONDS
+
     def _probe_item(self, item: LibraryItem, url: str, record: Optional[ProbeRecord]) -> None:
+        """Probe one item, write its ``<fileinfo>`` and save its probe state.
+
+        Contract:
+            Silences:
+                - Every ``Exception`` from the runner or the mapper is recorded as a failed
+                  probe (unexpected ones with a logged traceback).
+                - ``NfoError`` / ``OSError`` from the NFO write is a failed probe that keeps
+                  the new media info, so the write is retried later. Other exceptions from
+                  the write (a bug, a DB error from ownership) propagate to the caller.
+        """
         url_hash = url_fingerprint(url)
         self.progress.update(current_item=item.label, provider=self.progress.provider)
         with self._stats_lock:
@@ -303,6 +364,13 @@ class ProbeEngine:
         success_at: Optional[str] = None,
         failures: Optional[int] = None,
     ) -> None:
+        """Save the probe state of ``item``; omitted values keep those of ``record``.
+
+        Contract:
+            Silences:
+                - Every ``Exception`` from saving is logged and added to ``stats.errors``; the
+                  previous state stays in the DB.
+        """
         # A failed probe keeps previously detected media information.
         media_json = media.to_json() if media else (record.media_info if record else None)
         new = ProbeRecord(
@@ -323,8 +391,10 @@ class ProbeEngine:
         )
         try:
             self.state.save(new)
-        except Exception:
+        except Exception as exc:
             log.exception("Could not save probe state for %s", item.label)
+            with self._stats_lock:
+                self.stats.error(f"{item.label}: probe state could not be saved: {exc}")
 
 
 def probe_summary_dict(stats: ProbeStats) -> dict[str, Any]:

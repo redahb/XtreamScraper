@@ -36,12 +36,20 @@ class AppPaths:
         return os.path.join(self.data_dir, "logs")
 
     def ensure(self) -> None:
+        """Create the data and log folders (raises ``OSError`` when that is not possible)."""
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
 
 
 def resolve_paths(data_dir: Optional[str] = None, plugins_dir: Optional[str] = None) -> AppPaths:
-    """Data directory priority: explicit argument > environment variable > ``<app>/data``."""
+    """Data directory priority: explicit argument > environment variable > ``<app>/data``.
+
+    Contract:
+        Preconditions:
+            - An empty ``data_dir`` or empty ``XTREAMSCRAPER_DATA_DIR`` counts as unset.
+              Relative paths are made absolute against the current working directory, not the
+              app folder. Nothing is created or checked here (see :meth:`AppPaths.ensure`).
+    """
     root = app_root()
     chosen = data_dir or os.environ.get(DATA_DIR_ENV) or os.path.join(root, "data")
     return AppPaths(root=root, data_dir=os.path.abspath(chosen),

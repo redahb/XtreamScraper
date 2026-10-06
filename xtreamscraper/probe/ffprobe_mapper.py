@@ -37,11 +37,15 @@ DISPOSITION_FLAGS = {
 _INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 
 
-def _dict(value: Any) -> dict:
+def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _disposition(stream: dict, key: str) -> Optional[bool]:
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _disposition(stream: dict[str, Any], key: str) -> Optional[bool]:
     """Known only when ffprobe supplied the disposition object and the key in it."""
     disposition = stream.get("disposition")
     if not isinstance(disposition, dict) or key not in disposition:
@@ -49,21 +53,21 @@ def _disposition(stream: dict, key: str) -> Optional[bool]:
     return tri_state(disposition.get(key))
 
 
-def _flags(stream: dict) -> list[str]:
+def _flags(stream: dict[str, Any]) -> list[str]:
     disposition = _dict(stream.get("disposition"))
     return normalize_flags(flag for key, flag in DISPOSITION_FLAGS.items() if tri_state(disposition.get(key)))
 
 
-def _language(stream: dict) -> Optional[str]:
+def _language(stream: dict[str, Any]) -> Optional[str]:
     tags = _dict(stream.get("tags"))
     return normalize_language(tags.get("language") or tags.get("LANGUAGE"))
 
 
-def _side_data(stream: dict) -> list[dict]:
-    return [s for s in stream.get("side_data_list") or [] if isinstance(s, dict)]
+def _side_data(stream: dict[str, Any]) -> list[dict[str, Any]]:
+    return [s for s in _list(stream.get("side_data_list")) if isinstance(s, dict)]
 
 
-def _duration(stream: dict, format_duration: Optional[float]) -> Optional[int]:
+def _duration(stream: dict[str, Any], format_duration: Optional[float]) -> Optional[int]:
     """Stream duration, then container duration, then duration_ts * time_base."""
     seconds = positive_float(stream.get("duration")) or format_duration
     if not seconds:
@@ -74,7 +78,7 @@ def _duration(stream: dict, format_duration: Optional[float]) -> Optional[int]:
     return positive_int(seconds) if seconds else None
 
 
-def _aspect(stream: dict, width: Optional[int], height: Optional[int]) -> Optional[float]:
+def _aspect(stream: dict[str, Any], width: Optional[int], height: Optional[int]) -> Optional[float]:
     dar = parse_ratio(stream.get("display_aspect_ratio"))
     if dar:
         return round(float(dar), 4)
@@ -89,7 +93,7 @@ def _aspect(stream: dict, width: Optional[int], height: Optional[int]) -> Option
     return None  # SAR present but unusable (e.g. 0:1): don't guess
 
 
-def _frame_rate(stream: dict) -> Optional[float]:
+def _frame_rate(stream: dict[str, Any]) -> Optional[float]:
     for key in ("avg_frame_rate", "r_frame_rate"):
         rate = parse_ratio(stream.get(key))
         if rate:
@@ -97,7 +101,7 @@ def _frame_rate(stream: dict) -> Optional[float]:
     return None
 
 
-def _scan_type(stream: dict) -> Optional[str]:
+def _scan_type(stream: dict[str, Any]) -> Optional[str]:
     order = str(stream.get("field_order") or "").strip().lower()
     if order == "progressive":
         return "progressive"
@@ -106,7 +110,7 @@ def _scan_type(stream: dict) -> Optional[str]:
     return None
 
 
-def _hdr_type(stream: dict) -> Optional[str]:
+def _hdr_type(stream: dict[str, Any]) -> Optional[str]:
     """Dolby Vision > HDR10+ > HLG > HDR10 > unset. Only positive evidence counts."""
     types = [str(s.get("side_data_type") or "").lower() for s in _side_data(stream)]
     if any("dovi" in t or "dolby vision" in t for t in types):
@@ -121,7 +125,7 @@ def _hdr_type(stream: dict) -> Optional[str]:
     return None
 
 
-def _stereo_mode(stream: dict) -> Optional[str]:
+def _stereo_mode(stream: dict[str, Any]) -> Optional[str]:
     """Kodi stereomode from Stereo 3D side data; only side-by-side and top/bottom packings."""
     for side in _side_data(stream):
         if str(side.get("side_data_type") or "").strip().lower() != "stereo 3d":
@@ -135,7 +139,7 @@ def _stereo_mode(stream: dict) -> Optional[str]:
     return None
 
 
-def _video(stream: dict, format_duration: Optional[float]) -> VideoStreamInfo:
+def _video(stream: dict[str, Any], format_duration: Optional[float]) -> VideoStreamInfo:
     width, height = positive_int(stream.get("width")), positive_int(stream.get("height"))
     return VideoStreamInfo(
         codec=normalize_codec(stream.get("codec_name"), stream.get("codec_tag_string")),
@@ -158,7 +162,7 @@ def _video(stream: dict, format_duration: Optional[float]) -> VideoStreamInfo:
     )
 
 
-def _audio(stream: dict) -> AudioStreamInfo:
+def _audio(stream: dict[str, Any]) -> AudioStreamInfo:
     return AudioStreamInfo(
         codec=normalize_codec(stream.get("codec_name"), stream.get("codec_tag_string")),
         bitrate=positive_int(stream.get("bit_rate")),
@@ -172,7 +176,7 @@ def _audio(stream: dict) -> AudioStreamInfo:
     )
 
 
-def _subtitle(stream: dict) -> SubtitleStreamInfo:
+def _subtitle(stream: dict[str, Any]) -> SubtitleStreamInfo:
     return SubtitleStreamInfo(
         codec=normalize_codec(stream.get("codec_name"), stream.get("codec_tag_string")),
         width=positive_int(stream.get("width")),
@@ -186,10 +190,18 @@ def _subtitle(stream: dict) -> SubtitleStreamInfo:
 
 
 def map_ffprobe(data: Any) -> MediaInfo:
-    """Convert ``ffprobe -show_streams -show_format -print_format json`` output."""
+    """Convert ``ffprobe -show_streams -show_format -print_format json`` output.
+
+    Contract:
+        Silences:
+            - Never raises for content: a non-dict ``data``, a ``streams`` or ``side_data_list``
+              that is not a list, non-dict streams and unknown codec types are ignored, and every unclear value stays ``None``. Attached
+              pictures (cover art) are not video streams. Streams are ordered by their
+              ``index``; a missing or invalid index sorts like 0, ties keep input order.
+    """
     data = _dict(data)
     format_duration = positive_float(_dict(data.get("format")).get("duration"))
-    raw = [s for s in data.get("streams") or [] if isinstance(s, dict)]
+    raw = [s for s in _list(data.get("streams")) if isinstance(s, dict)]
     ordered = sorted(enumerate(raw), key=lambda p: (positive_int(p[1].get("index")) or 0, p[0]))
     media = MediaInfo()
     for _, stream in ordered:

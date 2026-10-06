@@ -7,9 +7,11 @@ migration runs in its own transaction and is recorded in ``schema_version``.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Callable, Sequence, Union
 
-Migration = tuple[int, Union[Sequence[str], Callable]]
+#: ``(version, statements)``: SQL statements, or a callable that migrates the connection itself.
+Migration = tuple[int, Union[Sequence[str], Callable[[sqlite3.Connection], None]]]
 
 _V1 = [
     """

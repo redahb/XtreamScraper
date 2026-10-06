@@ -17,7 +17,15 @@ DEFAULT_EPISODE_EXTENSION = "mkv"
 
 
 def normalize_base_url(raw: str) -> str:
-    """``host:8080/player_api.php?x=y`` -> ``http://host:8080``."""
+    """``host:8080/player_api.php?x=y`` -> ``http://host:8080``.
+
+    Contract:
+        Silences:
+            - Never validates: query and fragment are dropped, the scheme is lowercased,
+              the host part is kept as typed. ``user:pass@`` in the netloc is kept too.
+            - Blank input gives ``""``. Raises ``ValueError`` only for a netloc
+              ``urlsplit`` rejects (e.g. an unbalanced IPv6 bracket; implicit).
+    """
     value = (raw or "").strip()
     if not value:
         return ""
@@ -43,6 +51,12 @@ def _segment(value: str) -> str:
 
 
 def build_movie_url(base_url: str, username: str, password: str, stream_id: str, extension: str) -> str:
+    """``<base>/movie/<user>/<pass>/<id>.<ext>`` with each segment percent-encoded.
+
+    Contract:
+        Silences:
+            - An extension that is not 1-6 ASCII alphanumerics becomes ``mp4``.
+    """
     ext = clean_extension(extension, DEFAULT_MOVIE_EXTENSION)
     return f"{base_url.rstrip('/')}/movie/{_segment(username)}/{_segment(password)}/{_segment(stream_id)}.{ext}"
 
@@ -53,10 +67,19 @@ def build_episode_url(base_url: str, username: str, password: str, episode_id: s
 
 
 def stream_id_from_url(url: str) -> str | None:
-    """The item ID at the end of a movie/series stream URL (``.../1234.mkv`` -> ``1234``)."""
+    """The item ID at the end of a movie/series stream URL (``.../1234.mkv`` -> ``1234``).
+
+    Contract:
+        Silences:
+            - Returns None for a URL ``urlsplit`` rejects or one ending in ``/``.
+            - Does not percent-decode: for an ID the builders encode (e.g. ``"a b"`` ->
+              ``a%20b``) the result differs from the original ID.
+            - Only the last ``.ext`` is stripped; any URL (not only stream URLs) is accepted.
+    """
+    text = url.strip()
     try:
-        path = urlsplit(url.strip()).path
-    except ValueError:
+        path = urlsplit(text).path
+    except ValueError:  # e.g. an unbalanced IPv6 bracket in the netloc
         return None
     last = path.rsplit("/", 1)[-1]
     if not last:

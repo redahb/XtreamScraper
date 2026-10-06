@@ -5,8 +5,9 @@
 * Overwrite ON: meaningful plugin values replace destination values; collections are
   replaced when the plugin supplies a non-empty collection.
 * In both modes a missing, empty or invalid plugin value never erases anything.
-* External IDs and ratings are keyed by source: a plugin only ever adds or (with
-  overwrite) updates its own keys; other sources' IDs/ratings are untouched.
+* External IDs and ratings are keyed by source (namespace, lower-cased): a plugin adds every
+  key it supplies that the destination lacks and, with overwrite, also updates existing ones
+  (any namespace it supplies, not only its own); keys it does not supply are untouched.
 * IDs the user entered by hand (``locked_ids``) are never changed by any plugin, whatever
   its overwrite setting.
 * Artwork is not merged here: candidates are selected per slot by
@@ -36,7 +37,15 @@ def _norm(text: Optional[str]) -> str:
 
 
 def meaningful(value: Any) -> bool:
-    """Whether ``value`` carries real information (``None``, blanks, zeros and empties don't)."""
+    """Whether ``value`` carries real information (``None``, blanks, zeros and empties don't).
+
+    Contract:
+        Silences:
+            - Any number ``<= 0`` (and every ``bool``) is "not meaningful", so season number 0
+              (specials) is never merged from a plugin; the engine sets local season/episode
+              numbers itself.
+            - A type not listed here is always meaningful.
+    """
     if value is None or isinstance(value, bool):
         return False
     if isinstance(value, str):
@@ -95,10 +104,18 @@ KEY_FUNCTIONS: dict[str, Callable[[Any], list[Any]]] = {
 }
 
 
-def dedupe(items: Iterable[Any], key_fn: Callable[[Any], list[Any]], seen: Optional[set] = None) -> list[Any]:
-    """Keep the first of each identity; an item is a duplicate if *any* of its keys was seen."""
+def dedupe(items: Iterable[Any], key_fn: Callable[[Any], list[Any]], seen: Optional[set[Any]] = None) -> list[Any]:
+    """Keep the first of each identity; an item is a duplicate if *any* of its keys was seen.
+
+    Contract:
+        Preconditions:
+            - ``seen`` (when given) is updated in place, so a second call with the same set
+              drops items the first call kept.
+        Silences:
+            - Items that are not :func:`meaningful` are dropped.
+    """
     seen = set() if seen is None else seen
-    result = []
+    result: list[Any] = []
     for item in items:
         if not meaningful(item):
             continue
@@ -117,6 +134,16 @@ def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool,
 
     ``locked_ids``: external-ID namespaces whose value the user set by hand; ``src`` never
     changes them.
+
+    Contract:
+        Preconditions:
+            - ``locked_ids`` are lower-case namespaces (``src``'s keys are lower-cased before
+              the check).
+            - ``season_number`` / ``episode_number`` are only filled, never overwritten.
+        Silences:
+            - Values that are not :func:`meaningful`, blank ID/rating keys and blank IDs are
+              skipped; they never erase anything.
+            - Values are deep-copied, except external IDs (strings).
     """
     changed: set[str] = set()
 
@@ -140,7 +167,7 @@ def merge_into(dest: MetadataResult, src: MetadataResult, overwrite: bool,
         if overwrite:
             merged = incoming
         else:
-            seen: set = set()
+            seen: set[Any] = set()
             merged = dedupe(current, key_fn, seen) + dedupe(incoming, key_fn, seen)
         if merged != current:
             setattr(dest, name, copy.deepcopy(merged))

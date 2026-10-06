@@ -34,7 +34,13 @@ class ProbeRecord:
 _KEYS = ("provider_id", "content_type", "category_id", "item_id")
 
 
+#: ``(content_type, category_id, item_id)``: a probe row's key within one provider.
+ProbeKey = tuple[str, str, str]
+
+
 class ProbeStateRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -47,15 +53,22 @@ class ProbeStateRepository:
             return None
         return ProbeRecord(**{f.name: row[f.name] for f in fields(ProbeRecord)})
 
-    def all_for_provider(self, provider_id: int) -> dict[tuple[str, str, str], ProbeRecord]:
+    def all_for_provider(self, provider_id: int) -> dict[ProbeKey, ProbeRecord]:
         rows = self.db.query("SELECT * FROM probe_state WHERE provider_id = ?", (provider_id,))
-        result = {}
+        result: dict[ProbeKey, ProbeRecord] = {}
         for row in rows:
             rec = ProbeRecord(**{f.name: row[f.name] for f in fields(ProbeRecord)})
             result[(rec.content_type, rec.category_id, rec.item_id)] = rec
         return result
 
     def save(self, record: ProbeRecord) -> None:
+        """Insert or overwrite the probe row (whole record: every non-key column is replaced).
+
+        Contract:
+            Preconditions:
+                - ``content_type`` is ``movie`` or ``episode`` (CHECK constraint, else
+                  ``sqlite3.IntegrityError``); ``provider_id`` exists (foreign key).
+        """
         data = asdict(record)
         columns = ", ".join(data)
         placeholders = ", ".join("?" for _ in data)

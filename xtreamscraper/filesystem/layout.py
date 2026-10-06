@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Iterable, Optional, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 from . import atomic
 from .sanitize import sanitize_component
@@ -25,6 +25,11 @@ SERIES_DIR = "Series"
 
 
 class LibraryLayout:
+    """Where one provider's library lives: ``<target_root>/<provider_folder>/Movies|Series/...``."""
+
+    target_root: str
+    provider_folder: str
+
     def __init__(self, target_root: str, provider_folder: str) -> None:
         self.target_root = os.path.abspath(target_root)
         self.provider_folder = provider_folder
@@ -42,7 +47,21 @@ class LibraryLayout:
 
 # -- collision handling ------------------------------------------------------------------------
 def with_suffix(base: str, suffix: str, max_length: int) -> str:
-    """``base`` + ``suffix``, shortening ``base`` (not the suffix) to respect ``max_length``."""
+    """``base`` + ``suffix``, shortening ``base`` (not the suffix) to respect ``max_length``.
+
+    Contract:
+        Preconditions:
+            - ``base`` should already be a sanitized component; a ``:`` in it widens the
+              result (``": "`` becomes ``" - "``).
+
+        Silences:
+            - The suffix is never shortened, and ``base`` keeps at least 8 characters, so
+              the result can be longer than ``max_length``: up to
+              ``max(8, max_length - len(suffix)) + len(suffix)``. A long ID in the suffix
+              (``[xid-<64 characters>]``) therefore exceeds the setting.
+            - An empty ``base`` gives the suffix alone with its leading space stripped
+              (``[xid-1]``).
+    """
     room = max(8, max_length - len(suffix))
     return sanitize_component(base[:room].rstrip(" ._-") + suffix, max_length=max_length + len(suffix))
 
@@ -70,15 +89,33 @@ class NameAllocator:
             return True
         return False
 
-    def owner_of(self, name: str) -> Optional[str]:
+    def owner_of(self, name: str) -> str | None:
         return self._owners.get(name.casefold())
 
     def allocate(
         self,
         owner: str,
         candidates: Sequence[str],
-        is_foreign: Optional[Callable[[str], bool]] = None,
+        is_foreign: Callable[[str], bool] | None = None,
     ) -> str:
+        """Claim and return the first candidate that is free for ``owner``.
+
+        A candidate is free when nobody holds it (case-insensitively) or ``owner`` already
+        does. A name nobody holds is also skipped when ``is_foreign(name)`` says something
+        outside the database occupies it.
+
+        Contract:
+            Preconditions:
+                - The last candidate should be unique by construction (ID-suffixed), so one
+                  candidate is always free.
+
+            Silences:
+                - Empty candidates are skipped.
+                - When every candidate is taken, ``"<last candidate> (2)"``, ``(3)``, ... is
+                  claimed instead (``owner`` when there are no candidates). That fallback
+                  name is not sanitized, not length-capped and not checked with
+                  ``is_foreign``.
+        """
         for candidate in candidates:
             if not candidate:
                 continue
@@ -100,7 +137,7 @@ class NameAllocator:
             counter += 1
 
 
-def dedupe_candidates(values: Iterable[Optional[str]]) -> list[str]:
+def dedupe_candidates(values: Iterable[str | None]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for value in values:
@@ -111,25 +148,44 @@ def dedupe_candidates(values: Iterable[Optional[str]]) -> list[str]:
 
 
 def sidecar_names(directory: str, stem: str) -> list[str]:
-    """Files in ``directory`` belonging to ``stem`` (``stem.strm``, ``stem.nfo``, ``stem-thumb.jpg``)."""
+    """Files in ``directory`` belonging to ``stem`` (``stem.strm``, ``stem.nfo``, ``stem-thumb.jpg``).
+
+    A name belongs to ``stem`` when it starts with ``stem`` (case-insensitively) directly
+    followed by ``.`` or ``-``; ``stem - x.strm`` does not.
+
+    Contract:
+        Silences:
+            - An ``OSError`` from listing the folder (missing, not a folder, no access)
+              returns ``[]``, the same answer as a folder without sidecars.
+    """
     try:
         names = os.listdir(atomic.fs_path(directory))
     except OSError:
         return []
-    lowered = stem.casefold()
-    result = []
+    folded_stem = stem.casefold()
+    size = len(stem)
+    result: list[str] = []
     for name in names:
-        folded = name.casefold()
-        if folded.startswith(lowered + ".") or folded.startswith(lowered + "-"):
-            rest = name[len(stem):]
-            # "Show S01E01.strm" must not claim "Show S01E01 - x.strm" style siblings of another stem
-            if "." in rest or rest.startswith("-"):
-                result.append(name)
+        # Compare the stem-length prefix itself: folding the whole name can change its length
+        # ("STRASSE" folds like "Straße"), which would claim another stem's files.
+        # "Show S01E01.strm" must not claim "Show S01E01 - x.strm" style siblings of another stem.
+        if name[:size].casefold() == folded_stem and name[size:size + 1] in (".", "-"):
+            result.append(name)
     return result
 
 
-def rename_sidecars(directory: str, old_stem: str, new_stem: str, target_dir: Optional[str] = None) -> int:
-    """Move ``old_stem.*`` files to ``new_stem.*`` (optionally into ``target_dir``). Never overwrites."""
+def rename_sidecars(directory: str, old_stem: str, new_stem: str, target_dir: str | None = None) -> int:
+    """Move ``old_stem.*`` files to ``new_stem.*`` (optionally into ``target_dir``). Never overwrites.
+
+    Returns the number of files moved. The part after the stem keeps its original case.
+
+    Contract:
+        Silences:
+            - A file whose target name exists is left in place and not counted.
+            - An ``OSError`` while moving one file is logged as a warning, that file is
+              skipped and the others are still moved; the count is the only signal.
+            - An unreadable ``directory`` moves nothing and returns 0 (see ``sidecar_names``).
+    """
     target_dir = target_dir or directory
     moved = 0
     for name in sidecar_names(directory, old_stem):
@@ -147,6 +203,12 @@ def provider_folder_names(providers: Iterable[tuple[int, str, str]], max_length:
 
     Providers sharing a target folder and a (sanitised, case-insensitive) name are told
     apart with an ID suffix; the lowest ID keeps the plain name.
+
+    Contract:
+        Preconditions:
+            - Provider IDs are unique. ``target`` paths are grouped by
+              ``normcase(abspath(...))``, so an empty or relative target depends on the
+              current directory.
     """
     result: dict[int, str] = {}
     allocators: dict[str, NameAllocator] = {}

@@ -13,8 +13,9 @@ from ..utils.timeutil import now_iso, seconds_between
 RUNNING_STATES = ("queued", "running")
 
 
-class JobCancelled(Exception):
-    pass
+class JobCancelled(BaseException):
+    """Raised by :meth:`JobProgress.check_cancelled`. A ``BaseException`` so the many
+    ``except Exception`` blocks that isolate one failing item never swallow a cancel."""
 
 
 class JobProgress:
@@ -47,6 +48,16 @@ class JobProgress:
             self.started_at = now_iso()
 
     def finish(self, status: str, summary: Optional[dict[str, Any]] = None) -> None:
+        """Mark the job finished with ``status``.
+
+        Contract:
+            Preconditions:
+                - ``status`` should not be ``queued``/``running``: the job would stay ``active``
+                  (no check; nothing evicts it then).
+            Silences:
+                - A missing or empty ``summary`` keeps the summary set so far (the engines'
+                  live figures) instead of clearing it.
+        """
         with self._lock:
             self.status = status
             self.finished_at = now_iso()
@@ -71,6 +82,13 @@ class JobProgress:
 
     # -- updates -------------------------------------------------------------------------------
     def update(self, **values: Any) -> None:
+        """Set attributes by name under the lock (``provider``, ``phase``, ``current_item`` ...).
+
+        Contract:
+            Silences:
+                - Any key is accepted: a misspelt one creates a new attribute that ``to_dict``
+                  never shows, and a key such as ``status`` or ``errors`` overwrites job state.
+        """
         with self._lock:
             for key, value in values.items():
                 setattr(self, key, value)
@@ -84,6 +102,7 @@ class JobProgress:
             self.total += count
 
     def error(self, message: str) -> None:
+        """Count an error and keep its redacted text among the last 25 shown in the WebUI."""
         with self._lock:
             self.errors += 1
             self.recent_errors.append(redact(message))
@@ -93,6 +112,14 @@ class JobProgress:
             self.warnings += 1
 
     def to_dict(self) -> dict[str, Any]:
+        """A consistent JSON-ready snapshot for the WebUI.
+
+        Contract:
+            Silences:
+                - ``current_item`` is redacted here and ``recent_errors`` when recorded;
+                  ``description``, ``provider``, ``phase``, ``category`` and ``summary`` are
+                  passed as given, so callers must not put secrets in them.
+        """
         with self._lock:
             return {
                 "id": self.id,

@@ -7,8 +7,9 @@ as keys.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import asdict, dataclass, fields
-from typing import Iterable, Optional
+from typing import Iterable, Optional, TypeVar, Union
 
 from .db import Database
 
@@ -87,11 +88,26 @@ class EpisodeRecord:
     quarantine_path: Optional[str] = None
 
 
-def _from_row(cls, row):
+SyncRecord = Union[MovieRecord, SeriesRecord, EpisodeRecord]
+_R = TypeVar("_R", MovieRecord, SeriesRecord, EpisodeRecord)
+
+
+def _from_row(cls: type[_R], row: sqlite3.Row) -> _R:
     return cls(**{f.name: row[f.name] for f in fields(cls)})
 
 
-def _upsert(conn, table: str, record, keys: tuple[str, ...]) -> None:
+def _upsert(conn: sqlite3.Connection, table: str, record: SyncRecord, keys: tuple[str, ...]) -> None:
+    """Insert ``record`` or overwrite the stored row with it (whole record).
+
+    Contract:
+        Preconditions:
+            - Every dataclass field is a column of ``table`` (else ``sqlite3.OperationalError``).
+            - ``record`` was built from the stored row (or deliberately sets every field). Every
+              column except the keys and ``first_seen`` is overwritten, including the lifecycle
+              columns ``missing_since``, ``quarantined_at`` and ``quarantine_path``: a record
+              built with their ``None`` defaults clears them. The sync engine relies on this to
+              end the missing lifecycle when an item reappears.
+    """
     data = asdict(record)
     columns = ", ".join(data)
     placeholders = ", ".join("?" for _ in data)
@@ -104,6 +120,8 @@ def _upsert(conn, table: str, record, keys: tuple[str, ...]) -> None:
 
 
 class SyncStateRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -115,6 +133,7 @@ class SyncStateRepository:
         return {r["stream_id"]: _from_row(MovieRecord, r) for r in rows}
 
     def upsert_movies(self, records: Iterable[MovieRecord]) -> None:
+        """Save these movies in one transaction (whole-record overwrite, see :func:`_upsert`)."""
         with self.db.transaction() as conn:
             for record in records:
                 _upsert(conn, "movies", record, ("provider_id", "category_id", "stream_id"))
@@ -128,6 +147,14 @@ class SyncStateRepository:
             "UPDATE movies SET status = 'missing', missing_since = COALESCE(missing_since, ?) "
             "WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
             (now, provider_id, category_id, stream_id),
+        )
+
+    def clear_movie_missing(self, provider_id: int, category_id: str, stream_id: str) -> None:
+        """End the missing lifecycle: the movie is back and its ``.strm`` was restored."""
+        self.db.execute(
+            "UPDATE movies SET status = 'active', missing_since = NULL, quarantined_at = NULL, "
+            "quarantine_path = NULL WHERE provider_id = ? AND category_id = ? AND stream_id = ?",
+            (provider_id, category_id, stream_id),
         )
 
     def set_movie_quarantine(self, provider_id: int, category_id: str, stream_id: str, now: str,
@@ -146,8 +173,12 @@ class SyncStateRepository:
         return {r["series_id"]: _from_row(SeriesRecord, r) for r in rows}
 
     def upsert_series(self, record: SeriesRecord) -> None:
+        self.upsert_series_many([record])
+
+    def upsert_series_many(self, records: Iterable[SeriesRecord]) -> None:
         with self.db.transaction() as conn:
-            _upsert(conn, "series", record, ("provider_id", "category_id", "series_id"))
+            for record in records:
+                _upsert(conn, "series", record, ("provider_id", "category_id", "series_id"))
 
     def mark_series_missing(self, provider_id: int, category_id: str, series_id: str, now: str) -> None:
         self.db.execute(
@@ -164,6 +195,16 @@ class SyncStateRepository:
         )
         return {r["episode_id"]: _from_row(EpisodeRecord, r) for r in rows}
 
+    def episodes_in_category(self, provider_id: int, category_id: str) -> dict[str, dict[str, EpisodeRecord]]:
+        """Every episode of the category's series in one query: series ID -> episode ID -> record."""
+        rows = self.db.query(
+            "SELECT * FROM episodes WHERE provider_id = ? AND category_id = ?", (provider_id, category_id)
+        )
+        result: dict[str, dict[str, EpisodeRecord]] = {}
+        for r in rows:
+            result.setdefault(r["series_id"], {})[r["episode_id"]] = _from_row(EpisodeRecord, r)
+        return result
+
     def upsert_episodes(self, records: Iterable[EpisodeRecord]) -> None:
         with self.db.transaction() as conn:
             for record in records:
@@ -179,17 +220,23 @@ class SyncStateRepository:
 
     def move_episode_paths(self, provider_id: int, category_id: str, series_id: str, old_folder: str,
                            new_folder: str) -> None:
-        """The series folder was moved: keep stored episode paths (incl. quarantined ones) valid."""
+        """The series folder was moved: keep stored episode paths (incl. quarantined ones) valid.
+
+        A path moves only when it starts with ``old_folder`` followed by ``/`` or ``\\``; the
+        comparison is exact (no case folding or ``abspath``), so ``old_folder`` must be spelled
+        like the stored paths (it is: both come from the stored series folder). Other paths
+        are left unchanged, silently.
+        """
         old = old_folder.rstrip("/\\")
-        updates = []
+        updates: list[tuple[Optional[str], Optional[str], int, str, str, str]] = []
         for record in self.episodes_of_series(provider_id, category_id, series_id).values():
-            paths = []
+            paths: list[Optional[str]] = []
             for path in (record.strm_path, record.quarantine_path):
                 if path and path.startswith(old) and path[len(old):len(old) + 1] in ("/", "\\"):
                     path = new_folder.rstrip("/\\") + path[len(old):]
                 paths.append(path)
             if paths != [record.strm_path, record.quarantine_path]:
-                updates.append((*paths, provider_id, category_id, series_id, record.episode_id))
+                updates.append((paths[0], paths[1], provider_id, category_id, series_id, record.episode_id))
         if updates:
             with self.db.transaction() as conn:
                 conn.executemany(
@@ -206,6 +253,14 @@ class SyncStateRepository:
             (now, provider_id, category_id, series_id, episode_id),
         )
 
+    def clear_episode_missing(self, provider_id: int, category_id: str, series_id: str, episode_id: str) -> None:
+        """End the missing lifecycle: the episode is back and its ``.strm`` was restored."""
+        self.db.execute(
+            "UPDATE episodes SET status = 'active', missing_since = NULL, quarantined_at = NULL, "
+            "quarantine_path = NULL WHERE provider_id = ? AND category_id = ? AND series_id = ? AND episode_id = ?",
+            (provider_id, category_id, series_id, episode_id),
+        )
+
     def set_episode_quarantine(self, provider_id: int, category_id: str, series_id: str, episode_id: str,
                                now: str, path: Optional[str]) -> None:
         self.db.execute(
@@ -216,7 +271,8 @@ class SyncStateRepository:
 
     # -- summaries -----------------------------------------------------------------------
     def counts(self, provider_id: int) -> dict[str, int]:
-        result = {}
+        """``<table>_<status>`` -> rows, for movies/series/episodes x active/missing (zeros included)."""
+        result: dict[str, int] = {}
         for table in ("movies", "series", "episodes"):
             for status in (ACTIVE, MISSING):
                 row = self.db.query_one(

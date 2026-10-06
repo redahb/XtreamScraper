@@ -105,7 +105,21 @@ def apply_metadata(doc: NfoDocument, meta: MetadataResult, clear_missing: bool =
     """Write ``meta`` into ``doc``. ``<fileinfo>`` and media artwork are never touched.
 
     ``clear_missing`` rebuilds the descriptive part: managed tags ``meta`` has no value for
-    are removed instead of kept (used once after a manual match replaced a wrong one)."""
+    are removed instead of kept (used once after a manual match replaced a wrong one).
+
+    Contract:
+        Preconditions:
+            - ``meta`` must be the merged result (the NFO's own values plus the plugins'), not
+              one plugin's answer: when ``meta`` has any value for them, ``<uniqueid>``,
+              ``<ratings>``, ``<actor>`` and the list tags are replaced as a whole, so IDs or
+              ratings absent from ``meta`` are removed.
+              ID types and rating names are written as spelled in ``meta`` (callers pass the
+              lower-cased keys of ``merge_into``).
+            - A ``doc`` without a known root tag is written as a movie.
+        Silences:
+            - Values that are not ``meaningful`` keep the existing tag (or remove it with
+              ``clear_missing``); ``season``/``episode`` numbers are never cleared.
+    """
     c = clear_missing
     kind = doc.kind or NfoKind.MOVIE
     _set(doc, "title", meta.title, c)
@@ -149,7 +163,14 @@ def apply_metadata(doc: NfoDocument, meta: MetadataResult, clear_missing: bool =
 
 def apply_manual_ids(doc: NfoDocument, assign: dict[str, str], remove: dict[str, str]) -> None:
     """IDs the user set or withdrew by hand: ``<uniqueid>`` of each ``remove`` type is dropped only
-    while it still holds exactly that value; each ``assign`` value replaces its type's value."""
+    while it still holds exactly that value; each ``assign`` value replaces its type's value.
+
+    Contract:
+        Silences:
+            - The ``remove`` comparison ignores case and surrounding blanks of type and
+              value; a value the user changed since is kept without notice.
+            - A blank ``assign`` value is ignored (see :meth:`NfoDocument.set_uniqueid`).
+    """
     for id_type, value in remove.items():
         for el in list(doc.root.findall("uniqueid")):
             if (el.get("type") or "").strip().lower() == id_type.lower() \

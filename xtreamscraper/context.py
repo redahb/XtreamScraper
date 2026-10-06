@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Optional
 
 from .config.paths import AppPaths
 from .config.settings import SettingsStore
-from .jobs.manager import JobManager
+from .jobs.manager import ClientFactory, JobManager
 from .metadata.manager import ScraperManager
 from .metadata.manual_matching import ManualMatchService
 from .metadata.registry import PluginRegistry
+from .probe.engine import Runner
+from .storage.artwork import ArtworkRepository
 from .storage.categories import CategoryRepository
 from .storage.db import Database
 from .storage.history import MetadataHistoryRepository, ProbeHistoryRepository, SyncHistoryRepository
@@ -31,17 +33,36 @@ class AppContext:
     sync_history: SyncHistoryRepository
     probe_history: ProbeHistoryRepository
     jobs: JobManager
-    scrapers: Optional[ScraperManager] = None
-    metadata_history: Optional[MetadataHistoryRepository] = None
-    manual_matching: Optional[ManualMatchService] = None
+    scrapers: ScraperManager
+    metadata_history: MetadataHistoryRepository
+    manual_matching: ManualMatchService
+    artwork: ArtworkRepository
     log_path: str = ""
-    # Factory for Xtream clients: (provider, settings, **overrides) -> client. Tests replace it.
-    client_factory: Optional[Callable] = None
-    extra: dict = field(default_factory=dict)
+    # Factory for Xtream clients: (provider, settings) -> client. Tests replace it.
+    client_factory: Optional[ClientFactory] = None
+    # Runtime extras: "shutdown" (callback set by app.py), "shutting_down" (set by POST /api/shutdown),
+    # "interrupted_jobs" (jobs marked interrupted at start-up).
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
-def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[Callable] = None,
-                  probe_runner: Optional[Callable] = None, registry: Optional[PluginRegistry] = None) -> AppContext:
+def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[ClientFactory] = None,
+                  probe_runner: Optional[Runner] = None, registry: Optional[PluginRegistry] = None) -> AppContext:
+    """Open and migrate the database and build every long-lived service.
+
+    Contract:
+        Preconditions:
+            - Call it once per data dir and process: it marks every history row still
+              ``running`` as ``interrupted`` (the count is in ``extra["interrupted_jobs"]``), which
+              would also hit jobs of another live context on the same DB.
+            - Stored provider credentials are registered with ``redact`` right after the
+              migration and plugin secrets when ``ScraperManager`` is built; nothing that may log
+              provider or plugin data must run before those two steps.
+        Raises:
+            sqlite3.Error, OSError: Opening or migrating the database (not caught).
+        Silences:
+            - With ``registry=None`` plugins are discovered in ``paths.plugins_dir``; a missing
+              folder or a plugin that fails to load is skipped (logged by the registry).
+    """
     db = Database(paths.db_path)
     db.migrate()
     settings_store = SettingsStore(db)
@@ -77,6 +98,7 @@ def build_context(paths: AppPaths, log_path: str = "", client_factory: Optional[
         scrapers=scrapers,
         metadata_history=metadata_history,
         manual_matching=ManualMatchService(db, scrapers, jobs),
+        artwork=ArtworkRepository(db),
     )
     ctx.extra["interrupted_jobs"] = interrupted
     return ctx

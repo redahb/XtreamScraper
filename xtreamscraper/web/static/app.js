@@ -41,16 +41,57 @@ function fmtDuration(sec) {
   return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
 }
 
-const badge = (status) => `<span class="badge s-${esc(status || "none")}">${esc(status || "never")}</span>`;
+// The one place that turns an internal status into its visible label: an initial capital only,
+// acronyms as acronyms, never a raw underscore name.
+const STATUS_TEXT = {
+  ok: "OK", success: "Success", failed: "Failed", partial: "Partial", running: "Running", queued: "Queued",
+  cancelled: "Cancelled", interrupted: "Interrupted", matched: "Matched", unmatched: "Unmatched",
+  ambiguous: "Ambiguous", not_found: "Not found", invalid_binding: "Match no longer exists", api_error: "API error",
+  warn: "Warning", err: "Error",
+};
+
+function statusLabel(status) {
+  if (!status) return "Never";
+  if (STATUS_TEXT[status]) return STATUS_TEXT[status];
+  const words = String(status).replace(/_/g, " ");
+  return words.charAt(0).toLocaleUpperCase() + words.slice(1);
+}
+
+// A status as plain text in its status color (no pill). `label` replaces the standard label.
+const statusText = (status, label) =>
+  `<span class="status-text s-${esc(status || "none")}">${esc(label ?? statusLabel(status))}</span>`;
+
+const plural = (n, one, many) => `${n} ${Number(n) === 1 ? one : many}`;
 
 // ---------------------------------------------------------------------------------------
-// State & tabs
+// State & navigation (sidebar)
 // ---------------------------------------------------------------------------------------
-const state = { providers: [], tab: "dashboard", categories: null, categoryProvider: null, pollTimer: null };
+const state = { providers: [], tab: "dashboard", categories: null, categoryProvider: null, pollTimer: null,
+  activeJobs: 0, stopped: false };
 
-function showTab(name) {
+// Screen -> sidebar group. Screens without their own menu entry highlight their group's main item.
+const NAV_GROUP = {
+  dashboard: "home", providers: "providers", "provider-edit": "providers", "sync-history": "providers",
+  "probe-history": "providers", scrapers: "scrapers", "scraper-config": "scrapers", "metadata-history": "scrapers",
+  unmatched: "scrapers", settings: "settings", artwork: "settings", logs: "settings", about: "about",
+};
+const SIDEBAR_KEY = "xtreamscraper.sidebarCollapsed";
+
+function showTab(name, navItem) {
   state.tab = name;
-  $$("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  const group = NAV_GROUP[name];
+  const active = navItem || ($(`.nav button[data-nav="${name}"]`) ? name : $(`.nav-group[data-group="${group}"] .nav-main`).dataset.nav);
+  $$(".nav-group").forEach((g) => {
+    const open = g.dataset.group === group;
+    g.classList.toggle("open", open);
+    const main = $(".nav-main", g);
+    if ($(".nav-sub", g)) main.setAttribute("aria-expanded", String(open));
+  });
+  $$(".nav button[data-nav]").forEach((b) => {
+    const on = b.dataset.nav === active;
+    b.classList.toggle("active", on);
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  });
   $$(".tab").forEach((t) => t.classList.toggle("hidden", t.id !== "tab-" + name));
   if (name === "sync-history") loadSyncHistory();
   if (name === "probe-history") loadProbeHistory();
@@ -62,12 +103,71 @@ function showTab(name) {
   if (name === "artwork") { loadArtwork(); loadArtworkHistory(); }
   if (name === "about") loadAbout();
   if (name === "providers") renderProviders();
+  if (name === "provider-edit" && !navItem) openProviderForm(null);
+}
+
+function setSidebarCollapsed(collapsed, remember) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  const toggle = $(".nav-toggle");
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.setAttribute("aria-label", collapsed ? "Expand menu" : "Collapse menu");
+  toggle.title = toggle.getAttribute("aria-label");
+  if (remember) {
+    try { localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) { /* storage unavailable */ }
+  }
+}
+
+function initSidebar() {
+  let stored = null;
+  try { stored = localStorage.getItem(SIDEBAR_KEY); } catch (e) { /* storage unavailable */ }
+  // Narrow screens start collapsed unless the user chose otherwise.
+  setSidebarCollapsed(stored === null ? window.matchMedia("(max-width: 900px)").matches : stored === "1", false);
+}
+
+// ---------------------------------------------------------------------------------------
+// Top bar
+// ---------------------------------------------------------------------------------------
+const fmtCount = (n) => Number(n || 0).toLocaleString();
+
+function fmtSize(bytes) {
+  const mb = (bytes || 0) / (1024 * 1024);
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb).toLocaleString()} MB`;
+}
+
+function renderTopbar(data) {
+  const s = data.summary || {};
+  $("#version").textContent = data.version;
+  $("#sum-providers").textContent = fmtCount(s.providers);
+  $("#sum-plugins").textContent = fmtCount(s.plugins);
+  $("#sum-database").textContent = `${fmtSize(s.database_size_bytes)}, ${fmtCount(s.database_items)} items`;
+  $("#sum-matched").textContent = `${fmtCount(s.matched_titles)} of ${fmtCount(s.total_titles)}`;
+}
+
+async function shutdown() {
+  const jobs = state.activeJobs;
+  const question = jobs
+    ? `Shut down XtreamScraper?\n\n${jobs} running job${jobs === 1 ? " is" : "s are"} interrupted: ${jobs === 1 ? "it is" : "they are"} asked to stop first.`
+    : "Shut down XtreamScraper?";
+  if (!confirm(question)) return;
+  const button = $("#shutdown-button");
+  button.disabled = true;
+  try {
+    await api("POST", "/shutdown");
+  } catch (e) {
+    button.disabled = false;
+    toast(e.message, true);
+    return;
+  }
+  state.stopped = true;
+  clearTimeout(state.pollTimer);
+  $("#shutdown-overlay").classList.remove("hidden");
 }
 
 // ---------------------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------------------
 async function refreshStatus() {
+  if (state.stopped) return;
   let data;
   try {
     data = await api("GET", "/status");
@@ -75,8 +175,9 @@ async function refreshStatus() {
     schedulePoll(10000);
     return;
   }
+  if (state.stopped) return;
   state.providers = data.providers;
-  $("#version").textContent = data.version;
+  renderTopbar(data);
   const banner = $("#ffprobe-banner");
   if (data.ffprobe.found) {
     banner.classList.add("hidden");
@@ -89,12 +190,13 @@ async function refreshStatus() {
   renderDashboardProviders(data.providers);
   fillProviderFilters();
   if (state.tab === "providers") renderProviders();
-  const active = data.jobs.some((j) => j.active);
-  schedulePoll(active ? 2000 : 10000);
+  state.activeJobs = data.jobs.filter((j) => j.active).length;
+  schedulePoll(state.activeJobs ? 2000 : 10000);
 }
 
 function schedulePoll(ms) {
   clearTimeout(state.pollTimer);
+  if (state.stopped) return;
   state.pollTimer = setTimeout(refreshStatus, ms);
 }
 
@@ -110,9 +212,9 @@ function renderJobs(jobs) {
     const summary = Object.entries(j.summary || {}).filter(([k]) => k !== "errors").map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(" · ");
     return `<div class="job">
       <div class="head">
-        <div><strong>${esc(j.description)}</strong> ${badge(j.status)}
+        <div><strong>${esc(j.description)}</strong> ${statusText(j.status)}
           ${j.cancel_requested && j.active ? '<span class="muted small">cancelling…</span>' : ""}</div>
-        <div class="muted small">started ${fmtTime(j.started_at)} · ${fmtDuration(j.elapsed_seconds)}
+        <div class="muted small">Started ${fmtTime(j.started_at)} · ${fmtDuration(j.elapsed_seconds)}
           ${j.active ? `<button data-action="cancel-job" data-id="${esc(j.id)}">Cancel</button>` : ""}</div>
       </div>
       ${j.active ? `<div class="progress"><div data-pct="${pct}"></div></div>` : ""}
@@ -126,42 +228,50 @@ function renderJobs(jobs) {
   $$("[data-pct]", el).forEach((bar) => { bar.style.width = bar.dataset.pct + "%"; });
 }
 
+// Last Sync/Probe/Scrape: the run's status shows only as the color of its date (the label is in the tooltip).
+function lastRunTime(run) {
+  return `<span class="small s-${esc(run.status || "none")}" title="${esc(statusLabel(run.status))}">${fmtTime(run.started_at)}</span>`;
+}
+
 function syncCell(s) {
   if (!s) return '<span class="muted">never</span>';
-  return `${badge(s.status)} <span class="small">${fmtTime(s.started_at)}</span><br>
+  return `${lastRunTime(s)}<br>
     <span class="small muted">+${s.created ?? 0} new · ${s.updated ?? 0} upd · ${s.skipped ?? 0} unchanged · ${s.missing ?? 0} missing · ${s.error_count} err</span>`;
 }
 
 function probeCell(p) {
   if (!p) return '<span class="muted">never</span>';
-  return `${badge(p.status)} <span class="small">${fmtTime(p.started_at)}</span><br>
+  return `${lastRunTime(p)}<br>
     <span class="small muted">${p.probed ?? 0} probed · ${p.succeeded ?? 0} ok · ${p.failed ?? 0} failed · ${p.skipped ?? 0} skipped</span>`;
 }
 
 function metadataCell(m) {
   if (!m) return '<span class="muted">never</span>';
-  return `${badge(m.status)} <span class="small">${fmtTime(m.started_at)}</span><br>
+  return `${lastRunTime(m)}<br>
     <span class="small muted">${m.matched ?? 0} matched · ${m.updated ?? 0} updated · ${m.unmatched ?? 0} unmatched (${m.ambiguous ?? 0} ambiguous) · ${m.error_count} err</span>`;
 }
 
+// Home "Status": the last connection test only; its full message is the tooltip.
 function connCell(p) {
-  if (p.last_test_ok == null) return '<span class="muted">not tested</span>';
-  return `${badge(p.last_test_ok ? "ok" : "failed")}<br><span class="small muted">${esc(p.last_test_message || "")}</span>`;
+  if (p.last_test_ok == null) return '<span class="muted">Not tested</span>';
+  const status = p.last_test_ok ? "ok" : "failed";
+  return `<span class="status-text s-${status}" title="${esc(p.last_test_message || "")}">${esc(statusLabel(status))}</span>`;
 }
 
 function renderDashboardProviders(providers) {
   const body = $("#dashboard-providers");
   if (!providers.length) {
-    body.innerHTML = '<tr><td colspan="8" class="muted">No providers yet – add one on the Providers tab.</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="muted">No providers yet – add one under Providers › Add provider.</td></tr>';
     return;
   }
   body.innerHTML = providers.map((p) => {
     const c = p.counts;
     return `<tr>
-      <td><strong>${esc(p.name)}</strong><br><span class="small muted">${esc(p.effective_target_folder || "no target folder")}</span></td>
-      <td>${p.enabled ? badge("ok").replace(">ok<", ">enabled<") : '<span class="badge">disabled</span>'}</td>
+      <td><input type="checkbox" class="provider-enabled" data-action="provider-enabled" data-id="${p.id}" ${p.enabled ? "checked" : ""}
+          aria-label="Enable ${esc(p.name)}" title="${p.enabled ? "Enabled" : "Disabled"}">
+        <strong>${esc(p.name)}</strong><br><span class="small muted">${esc(p.effective_target_folder || "no target folder")}</span></td>
       <td>${connCell(p)}</td>
-      <td>${p.activity ? badge("running").replace(">running<", `>${esc(p.activity)}<`) : '<span class="muted">idle</span>'}</td>
+      <td>${p.activity ? statusText("running", p.activity) : '<span class="muted">idle</span>'}</td>
       <td>${syncCell(p.last_sync)}</td>
       <td>${probeCell(p.last_probe)}</td>
       <td>${metadataCell(p.last_metadata)}</td>
@@ -171,52 +281,107 @@ function renderDashboardProviders(providers) {
   }).join("");
 }
 
+async function setProviderEnabled(box) {
+  const previous = !box.checked;
+  box.disabled = true;
+  try {
+    await api("POST", `/providers/${box.dataset.id}/enabled`, { enabled: box.checked });
+  } catch (e) {
+    box.checked = previous;
+    toast(e.message, true);
+  } finally {
+    box.disabled = false;
+  }
+  refreshStatus();
+}
+
 // ---------------------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------------------
-function renderProviders() {
-  const el = $("#provider-list");
-  if (!state.providers.length) {
-    el.innerHTML = '<p class="muted">No providers configured.</p>';
-    return;
-  }
-  el.innerHTML = state.providers.map((p) => `
-    <div class="card provider-card">
+// "Movies (enabled, 1 category)"
+const contentText = (label, enabled, categories) =>
+  `${label} (${enabled ? "enabled" : "disabled"}, ${plural(categories ?? 0, "category", "categories")})`;
+
+function providerCardHtml(p) {
+  return `
+    <div class="card provider-card" data-provider-id="${p.id}">
       <div class="head">
-        <div><strong>${esc(p.name)}</strong> ${p.enabled ? "" : '<span class="badge">disabled</span>'}
-          ${p.activity ? badge("running").replace(">running<", `>${esc(p.activity)}<`) : ""}</div>
-        <label class="small"><span><input type="checkbox" data-action="toggle-enabled" data-id="${p.id}" ${p.enabled ? "checked" : ""}> Enabled</span></label>
+        <div><strong>${esc(p.name)}</strong> ${p.enabled ? "" : '<span class="muted">Disabled</span>'}
+          ${p.activity ? statusText("running", p.activity) : ""}</div>
       </div>
       <dl class="kv">
-        <dt>Base URL</dt><dd>${esc(p.base_url)}</dd>
-        <dt>Username</dt><dd>${esc(p.username)}</dd>
-        <dt>Target folder</dt><dd>${esc(p.effective_target_folder || "– not set –")}${p.target_folder ? "" : ' <span class="muted">(default)</span>'}</dd>
-        <dt>Content</dt><dd>Movies ${p.movies_enabled ? "on" : "off"} (${p.selected_movie_categories} categories) · Series ${p.series_enabled ? "on" : "off"} (${p.selected_series_categories} categories)</dd>
-        <dt>Connection</dt><dd>${connCell(p)}</dd>
+        <dt>Base URL:</dt><dd>${esc(p.base_url)}</dd>
+        <dt>Username:</dt><dd>${esc(p.username)}</dd>
+        <dt>Target folder:</dt><dd>${esc(p.effective_target_folder || "– not set –")}${p.target_folder ? "" : ' <span class="muted">(default)</span>'}</dd>
+        <dt>Content:</dt><dd>${esc(contentText("Movies", p.movies_enabled, p.selected_movie_categories))} · ${esc(contentText("Series", p.series_enabled, p.selected_series_categories))}</dd>
+        <dt>Connection:</dt><dd>${p.last_test_ok == null ? '<span class="muted">Not tested</span>' : esc(p.last_test_message || (p.last_test_ok ? "OK" : "Failed"))}</dd>
       </dl>
       <div class="actions">
         <button data-action="edit-provider" data-id="${p.id}">Edit</button>
         <button data-action="test-provider" data-id="${p.id}">Test Connection</button>
         <button data-action="open-categories" data-id="${p.id}">Categories</button>
-        <button class="primary" data-action="sync" data-id="${p.id}" data-scope="all">Sync</button>
-        <button data-action="sync" data-id="${p.id}" data-scope="movies">Sync Movies</button>
-        <button data-action="sync" data-id="${p.id}" data-scope="series">Sync Series</button>
-        <button data-action="sync" data-id="${p.id}" data-scope="all" data-full="1" title="Re-fetch every series, ignoring the unchanged shortcut">Full sync</button>
-        <button data-action="probe" data-id="${p.id}" data-scope="all">Probe</button>
-        <button data-action="probe" data-id="${p.id}" data-scope="movies">Probe Movies</button>
-        <button data-action="probe" data-id="${p.id}" data-scope="series">Probe Series</button>
-        <button data-action="probe" data-id="${p.id}" data-scope="all" data-force="1">Force re-probe</button>
-        <button data-action="scrape" data-id="${p.id}" data-scope="all">Scrape Metadata</button>
-        <button data-action="scrape" data-id="${p.id}" data-scope="all" data-force="1">Force metadata refresh</button>
         <button class="danger" data-action="delete-provider" data-id="${p.id}">Delete</button>
       </div>
-    </div>`).join("");
+      <div class="actions action-row">
+        <button class="action-sync" data-action="sync" data-id="${p.id}" data-scope="all">Sync</button>
+        <button class="action-sync" data-action="sync" data-id="${p.id}" data-scope="movies">Sync Movies</button>
+        <button class="action-sync" data-action="sync" data-id="${p.id}" data-scope="series">Sync Series</button>
+        <button class="action-sync" data-action="sync" data-id="${p.id}" data-scope="all" data-full="1" title="Re-fetch every series, ignoring the unchanged shortcut">Forced Sync</button>
+        <button class="action-probe" data-action="probe" data-id="${p.id}" data-scope="all">Probe</button>
+        <button class="action-probe" data-action="probe" data-id="${p.id}" data-scope="movies">Probe Movies</button>
+        <button class="action-probe" data-action="probe" data-id="${p.id}" data-scope="series">Probe Series</button>
+        <button class="action-probe" data-action="probe" data-id="${p.id}" data-scope="all" data-force="1">Forced Probe</button>
+        <button class="action-scrape" data-action="scrape" data-id="${p.id}" data-scope="all">Scrape</button>
+        <button class="action-scrape" data-action="scrape" data-id="${p.id}" data-scope="movies">Scrape Movies</button>
+        <button class="action-scrape" data-action="scrape" data-id="${p.id}" data-scope="series">Scrape Series</button>
+        <button class="action-scrape" data-action="scrape" data-id="${p.id}" data-scope="all" data-force="1">Forced Scrape</button>
+      </div>
+    </div>`;
+}
+
+// The provider cards are re-rendered on every status poll. The single category panel sits right
+// below the card of the provider it edits; it is never detached while it stays there, so a poll
+// keeps its filter text, ticks and focus.
+function renderProviders() {
+  const el = $("#provider-list");
+  const panel = $("#category-panel");
+  const template = document.createElement("template");
+  template.innerHTML = state.providers.length ? state.providers.map(providerCardHtml).join("")
+    : '<p class="muted">No providers configured.</p>';
+  const items = Array.from(template.content.children);
+  const open = state.categoryProvider != null && !panel.classList.contains("hidden");
+  const active = open ? items.findIndex((c) => Number(c.dataset.providerId) === state.categoryProvider) : -1;
+  if (open && active < 0) closeCategories();  // the provider is gone
+  Array.from(el.children).forEach((child) => { if (child !== panel) child.remove(); });
+  if (active < 0) {
+    if (panel.parentNode === el) el.after(panel);
+    el.append(...items);
+    return;
+  }
+  if (panel.parentNode !== el) el.append(panel);
+  items.slice(0, active + 1).forEach((card) => el.insertBefore(card, panel));
+  el.append(...items.slice(active + 1));
+}
+
+// Puts the category panel right below the card of provider `id` (or back after the list).
+function placeCategoryPanel(id) {
+  const panel = $("#category-panel");
+  const card = $(`#provider-list .provider-card[data-provider-id="${Number(id)}"]`);
+  if (card) card.after(panel); else $("#provider-list").after(panel);
+}
+
+function closeCategories() {
+  const panel = $("#category-panel");
+  panel.classList.add("hidden");
+  state.categories = null;
+  state.categoryProvider = null;
+  $("#provider-list").after(panel);
 }
 
 function openProviderForm(p) {
   const form = $("#provider-edit");
   form.reset();
-  $("#provider-form").classList.remove("hidden");
+  showTab("provider-edit", p ? "providers" : "provider-edit");
   $("#provider-test-result").textContent = "";
   $("#provider-form-title").textContent = p ? `Edit provider – ${p.name}` : "Add provider";
   form.id.value = p ? p.id : "";
@@ -245,7 +410,7 @@ async function saveProvider(ev) {
   try {
     const res = id ? await api("PUT", `/providers/${id}`, data) : await api("POST", "/providers", data);
     toast(`Saved ${res.provider.name}`);
-    $("#provider-form").classList.add("hidden");
+    showTab("providers");
     await refreshStatus();
     if (!id) openCategories(res.provider.id);
   } catch (e) {
@@ -259,6 +424,7 @@ async function saveProvider(ev) {
 async function openCategories(id) {
   const p = state.providers.find((x) => x.id === Number(id));
   state.categoryProvider = Number(id);
+  placeCategoryPanel(id);
   $("#category-panel").classList.remove("hidden");
   $("#category-provider").textContent = p ? p.name : id;
   $("#category-status").textContent = "";
@@ -348,7 +514,7 @@ async function loadSyncHistory() {
   const data = await api("GET", "/history/sync" + (pid ? `?provider_id=${pid}` : ""));
   $("#sync-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
     <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.sync_type)}</td>
-    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${statusText(h.status)}</td>
     <td>${h.created}</td><td>${h.updated}</td><td>${h.skipped}</td><td>${h.missing}</td>
     <td>${h.error_count ? `<span class="s-err">${h.error_count}</span>` : 0}</td>
     <td><button data-action="sync-detail" data-id="${h.id}">Details</button></td></tr>`).join("")
@@ -360,7 +526,7 @@ async function loadProbeHistory() {
   const data = await api("GET", "/history/probe" + (pid ? `?provider_id=${pid}` : ""));
   $("#probe-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
     <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.scope)}${h.forced ? " (forced)" : ""}</td>
-    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${statusText(h.status)}</td>
     <td>${h.considered}</td><td>${h.probed}</td><td>${h.skipped}</td><td>${h.succeeded}</td>
     <td>${h.failed ? `<span class="s-err">${h.failed}</span>` : 0}</td>
     <td><button data-action="probe-detail" data-id="${h.id}">Details</button></td></tr>`).join("")
@@ -372,7 +538,7 @@ function detailHtml(item, title) {
     .map(([k, v]) => `<div><span class="muted">${esc(k.replace(/_/g, " "))}:</span> ${v}</div>`).join("");
   const cats = (item.stats && item.stats.categories) || [];
   const list = (arr) => arr.length ? `<ul class="msglist">${arr.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` : '<p class="muted small">None.</p>';
-  return `<h2>${esc(title)} – ${esc(item.provider_name)} ${badge(item.status)}</h2>
+  return `<h2>${esc(title)} – ${esc(item.provider_name)} ${statusText(item.status)}</h2>
     <p class="small muted">${fmtTime(item.started_at)} → ${fmtTime(item.finished_at)} (${fmtDuration(item.duration_seconds)})</p>
     <div class="stats">${stats}</div>
     ${cats.length ? `<h3>Categories processed</h3><p class="small">${cats.map(esc).join(", ")}</p>` : ""}
@@ -429,13 +595,15 @@ async function loadScrapers() {
   const n = data.plugins.length;
   body.innerHTML = n ? data.plugins.map((p, i) => `<tr>
     <td>${p.priority}
-      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="up" ${i === 0 ? "disabled" : ""} title="Move up">▲</button>
-      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="down" ${i === n - 1 ? "disabled" : ""} title="Move down">▼</button></td>
+      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="up" ${i === 0 ? "disabled" : ""} title="Move up" aria-label="Move ${esc(p.name)} up">🞁</button>
+      <button data-action="scraper-move" data-id="${esc(p.plugin_id)}" data-dir="down" ${i === n - 1 ? "disabled" : ""} title="Move down" aria-label="Move ${esc(p.name)} down">🞃</button></td>
     <td><strong>${esc(p.name)}</strong> ${p.version ? `<span class="muted small">${esc(p.version)}</span>` : ""}</td>
     <td class="small">${p.media_types.map(esc).join(", ") || "–"}</td>
-    <td><label class="small"><span><input type="checkbox" data-action="scraper-enabled" data-id="${esc(p.plugin_id)}" ${p.enabled ? "checked" : ""}> ${p.enabled ? "enabled" : "disabled"}</span></label></td>
-    <td><label class="small"><span><input type="checkbox" data-action="scraper-overwrite" data-id="${esc(p.plugin_id)}" ${p.overwrite ? "checked" : ""}> ${p.overwrite ? "on" : "off"}</span></label></td>
-    <td>${p.configured ? badge("ok").replace(">ok<", ">configured<") : '<span class="badge s-warn">not configured</span>'}</td>
+    <td><input type="checkbox" data-action="scraper-enabled" data-id="${esc(p.plugin_id)}" ${p.enabled ? "checked" : ""}
+      aria-label="Enable ${esc(p.name)}" title="${p.enabled ? "Enabled" : "Disabled"}"></td>
+    <td><input type="checkbox" data-action="scraper-overwrite" data-id="${esc(p.plugin_id)}" ${p.overwrite ? "checked" : ""}
+      aria-label="Overwrite existing data with ${esc(p.name)}" title="Overwrite ${p.overwrite ? "on" : "off"}"></td>
+    <td>${p.configured ? statusText("ok", "Configured") : statusText("warn", "Not configured")}</td>
     <td>${p.has_config ? `<button data-action="scraper-configure" data-id="${esc(p.plugin_id)}">Configure</button>` : ""}
       <button data-action="scraper-test" data-id="${esc(p.plugin_id)}">Test</button></td></tr>`).join("")
     : '<tr><td colspan="7" class="muted">No scraper plugins installed.</td></tr>';
@@ -461,7 +629,7 @@ async function openScraperConfig(id) {
     }
     if (f.type === "secret") {
       const set = data.secrets[f.key];
-      return `<label>${esc(f.label)} ${set ? badge("ok").replace(">ok<", ">configured<") : '<span class="badge s-warn">not set</span>'}
+      return `<label>${esc(f.label)} ${set ? statusText("ok", "Configured") : statusText("warn", "Not set")}
         <input type="password" name="${esc(f.key)}" autocomplete="new-password" placeholder="${set ? "Configured – leave empty to keep" : ""}">${help}</label>`;
     }
     const type = f.type === "integer" ? "number" : "text";
@@ -512,7 +680,7 @@ async function saveScraperConfig(ev) {
 async function testScraper(id, values, test) {
   const res = await api("POST", `/scrapers/${encodeURIComponent(id)}/test`, { ...(values ? { values } : {}), ...(test ? { test } : {}) });
   if (id === scraperPage.id) renderScraperStatus(res.status);
-  return `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
+  return `${statusText(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
 }
 
 async function loadMetadataHistory() {
@@ -520,7 +688,7 @@ async function loadMetadataHistory() {
   const data = await api("GET", "/history/metadata" + (pid ? `?provider_id=${pid}` : ""));
   $("#metadata-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
     <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.scope)}${h.forced ? " (forced)" : ""}</td>
-    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${statusText(h.status)}</td>
     <td>${h.considered}</td><td>${h.matched}</td><td>${h.unmatched}</td><td>${h.ambiguous}</td><td>${h.updated}</td>
     <td>${h.unchanged}</td><td>${h.skipped}</td><td>${h.error_count ? `<span class="s-err">${h.error_count}</span>` : 0}</td>
     <td class="small">${(h.plugins || []).map(esc).join(", ")}</td>
@@ -533,8 +701,6 @@ async function loadMetadataHistory() {
 // Unmatched media & manual matching
 // ---------------------------------------------------------------------------------------
 const unmatched = { offset: 0, limit: 50, total: 0, items: [], types: null, current: null, request: null, qTimer: null };
-const UM_STATUS = { matched: "matched", unmatched: "unmatched", ambiguous: "ambiguous", invalid_binding: "match gone",
-  not_found: "not found", api_error: "source error" };
 const KIND_NAMES = { movie: "Movie", series: "Series" };
 
 async function manualTypes(reload) {
@@ -565,10 +731,10 @@ async function loadUnmatched(resetPage) {
   if (data.offset && !data.items.length) { unmatched.offset = 0; return loadUnmatched(false); }
   $("#um-list").innerHTML = data.items.length ? data.items.map((item, i) => `<tr>
     <td><strong>${esc(item.title)}</strong>${item.year ? ` (${item.year})` : ""}<br>
-      <span class="badge ${item.matched ? "s-matched" : "s-unmatched"}">${item.matched ? "Matched" : "Unmatched"}</span></td>
+      ${statusText(item.matched ? "matched" : "unmatched")}</td>
     <td>${esc(KIND_NAMES[item.item_kind])}</td>
     <td>${esc(item.provider_name)}<br><span class="small muted">${esc(item.category_name || "#" + item.category_id)}</span></td>
-    <td>${item.plugins.map((p) => `<div class="um-plugin"><span class="badge s-${esc(p.status)}">${esc(p.name)}: ${esc(UM_STATUS[p.status] || p.status)}</span>
+    <td>${item.plugins.map((p) => `<div class="um-plugin">${statusText(p.status, `${p.name}: ${statusLabel(p.status)}`)}
       ${p.manual ? '<span class="small">set by hand</span>' : ""}
       ${p.message && p.status !== "matched" ? `<span class="small muted">${esc(p.message)}</span>` : ""}</div>`).join("")}</td>
     <td class="small">${fmtTime(item.last_attempt)}</td>
@@ -599,7 +765,7 @@ function bindingHtml(item, b, plugin) {
       <td>${c.score != null ? esc(Math.round(c.score)) : "–"}</td><td class="small">${esc(c.remote_id)}</td>
       <td>${canUse ? `<button data-action="um-candidate" data-plugin="${esc(b.plugin_id)}" data-candidate="${i}">Use this match</button>` : ""}</td></tr>`).join("")}
     </tbody></table>` : "";
-  return `<div class="um-binding"><strong>${esc(b.name)}</strong> <span class="badge s-${esc(b.status)}">${esc(UM_STATUS[b.status] || b.status)}</span>
+  return `<div class="um-binding"><strong>${esc(b.name)}</strong> ${statusText(b.status)}
     <span class="small muted">last attempt ${fmtTime(b.last_attempt)}</span>
     ${b.message ? `<p class="small muted">${esc(b.message)}</p>` : ""}${matched}${candidates}
     <div class="toolbar small">${actions}</div></div>`;
@@ -736,7 +902,14 @@ function selectPlugin(pluginId, namespace) {
 // ---------------------------------------------------------------------------------------
 // Artwork
 // ---------------------------------------------------------------------------------------
-const STATUS_LABELS = { ok: "ok", pending: "pending", external: "kept (not ours)", kept: "kept (newer available)",
+const ACRONYMS = new Set(["nfo", "url", "urls", "id", "ids", "api"]);
+
+// "managed nfo refs" -> "Managed NFO Refs"
+function titleCase(text) {
+  return String(text).replace(/[A-Za-z]+/g, (w) => ACRONYMS.has(w.toLowerCase()) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1));
+}
+
+const STATUS_LABELS = { ok: "OK", pending: "pending", external: "kept (not ours)", kept: "kept (newer available)",
   modified: "changed outside app", disabled: "disabled", error: "error" };
 
 async function loadArtwork() {
@@ -750,11 +923,11 @@ async function loadArtwork() {
     else input.value = value;
   }
   const c = data.counts;
-  const slots = Object.entries(c.slots || {}).map(([k, v]) => `<div><span class="muted">${esc(STATUS_LABELS[k] || k)}:</span> ${v}</div>`).join("");
-  $("#artwork-counts").innerHTML = `<div><span class="muted">selected artwork:</span> ${c.slot_total}</div>${slots}
-    <div><span class="muted">managed local files:</span> ${c.managed_files}</div>
-    <div><span class="muted">protected (changed outside app):</span> ${c.modified_files}</div>
-    <div><span class="muted">managed NFO links:</span> ${c.nfo_refs}</div>`;
+  const stat = (label, value) => `<div><span class="muted">${esc(titleCase(label))}:</span> ${value}</div>`;
+  $("#artwork-counts").innerHTML = stat("selected artwork", c.slot_total)
+    + Object.entries(c.slots || {}).map(([k, v]) => stat(STATUS_LABELS[k] || k, v)).join("")
+    + stat("managed local files", c.managed_files) + stat("protected (changed outside app)", c.modified_files)
+    + stat("managed NFO links", c.nfo_refs);
 }
 
 async function saveArtwork(ev) {
@@ -792,7 +965,7 @@ async function loadArtworkHistory() {
   const data = await api("GET", "/history/artwork" + (pid ? `?provider_id=${pid}` : ""));
   $("#artwork-history").innerHTML = data.items.length ? data.items.map((h) => `<tr>
     <td>${esc(h.provider_name)}</td><td>${fmtTime(h.started_at)}</td><td>${esc(h.mode)}${h.forced ? " (force)" : ""}</td>
-    <td>${fmtDuration(h.duration_seconds)}</td><td>${badge(h.status)}</td>
+    <td>${fmtDuration(h.duration_seconds)}</td><td>${statusText(h.status)}</td>
     <td>${h.considered}</td><td>${h.downloaded}</td><td>${h.nfo_urls_written}</td><td>${h.local_removed}</td>
     <td>${h.nfo_refs_removed}</td><td>${h.unchanged}</td><td>${h.skipped}</td>
     <td>${h.error_count ? `<span class="s-err">${h.error_count}</span>` : 0}</td>
@@ -830,9 +1003,10 @@ const actions = {
   "sync": (btn) => startJob("sync", btn),
   "probe": (btn) => startJob("probe", btn),
   "cancel-job": async (btn) => { await api("POST", `/jobs/${btn.dataset.id}/cancel`); refreshStatus(); },
-  "add-provider": () => openProviderForm(null),
+  "shutdown": () => shutdown(),
+  "toggle-sidebar": () => setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"), true),
   "edit-provider": (btn) => openProviderForm(state.providers.find((p) => p.id === Number(btn.dataset.id))),
-  "cancel-provider": () => $("#provider-form").classList.add("hidden"),
+  "cancel-provider": () => showTab("providers"),
   "delete-provider": async (btn) => {
     const p = state.providers.find((x) => x.id === Number(btn.dataset.id));
     if (!confirm(`Delete provider "${p.name}"?\n\nIts settings, categories and sync state are removed. Files already written to the library are NOT deleted.`)) return;
@@ -851,7 +1025,7 @@ const actions = {
     $("#provider-test-result").textContent = "Testing…";
     try {
       const res = await api("POST", "/providers/test", providerFormData());
-      $("#provider-test-result").innerHTML = `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
+      $("#provider-test-result").innerHTML = `${statusText(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
     } catch (e) { $("#provider-test-result").textContent = e.message; } finally { btn.disabled = false; }
   },
   "open-categories": (btn) => openCategories(btn.dataset.id).catch((e) => toast(e.message, true)),
@@ -859,7 +1033,7 @@ const actions = {
   "cat-all": (btn) => { $$(`input[data-cat="${btn.dataset.type}"]`).forEach((b) => { if (!b.closest("label").classList.contains("hidden")) b.checked = true; }); updateCategoryCount(btn.dataset.type); },
   "cat-none": (btn) => { $$(`input[data-cat="${btn.dataset.type}"]`).forEach((b) => { if (!b.closest("label").classList.contains("hidden")) b.checked = false; }); updateCategoryCount(btn.dataset.type); },
   "cat-save": () => saveCategories(),
-  "cat-close": () => { $("#category-panel").classList.add("hidden"); state.categories = null; },
+  "cat-close": () => closeCategories(),
   "reload-sync-history": () => loadSyncHistory(),
   "reload-probe-history": () => loadProbeHistory(),
   "sync-detail": async (btn) => {
@@ -873,7 +1047,7 @@ const actions = {
   "test-ffprobe": async () => {
     $("#ffprobe-result").textContent = "Testing…";
     const res = await api("POST", "/settings/test-ffprobe", { ffprobe_path: $("#settings-form").elements.ffprobe_path.value });
-    $("#ffprobe-result").innerHTML = `${badge(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
+    $("#ffprobe-result").innerHTML = `${statusText(res.ok ? "ok" : "failed")} ${esc(res.message)}`;
   },
   "reload-logs": () => loadLogs(),
   "scrape": (btn) => startJob("scrape", btn),
@@ -914,8 +1088,8 @@ const actions = {
 };
 
 document.addEventListener("click", (ev) => {
-  const tab = ev.target.closest("#tabs button");
-  if (tab) return showTab(tab.dataset.tab);
+  const nav = ev.target.closest("button[data-nav]");
+  if (nav) return showTab(nav.dataset.nav);
   const btn = ev.target.closest("button[data-action]");
   if (btn && actions[btn.dataset.action]) {
     ev.preventDefault();
@@ -925,9 +1099,7 @@ document.addEventListener("click", (ev) => {
 
 document.addEventListener("change", async (ev) => {
   const t = ev.target;
-  if (t.dataset.action === "toggle-enabled") {
-    try { await api("POST", `/providers/${t.dataset.id}/enabled`, { enabled: t.checked }); refreshStatus(); } catch (e) { toast(e.message, true); }
-  } else if (t.dataset.cat) {
+  if (t.dataset.cat) {
     updateCategoryCount(t.dataset.cat);
   } else if (t.classList.contains("provider-filter")) {
     t.id.startsWith("sync") ? loadSyncHistory() : t.id.startsWith("probe") ? loadProbeHistory()
@@ -938,6 +1110,8 @@ document.addEventListener("change", async (ev) => {
     fillNamespaces();
   } else if (t.form && t.form.id === "um-form" && t.name === "namespace") {
     showFieldHelp();
+  } else if (t.dataset.action === "provider-enabled") {
+    await setProviderEnabled(t);
   } else if (t.dataset.action === "scraper-enabled" || t.dataset.action === "scraper-overwrite") {
     const field = t.dataset.action === "scraper-enabled" ? "enabled" : "overwrite";
     try { await api("POST", `/scrapers/${encodeURIComponent(t.dataset.id)}/${field}`, { [field]: t.checked }); } catch (e) { toast(e.message, true); }
@@ -961,4 +1135,6 @@ $("#provider-edit").addEventListener("submit", saveProvider);
 $("#settings-form").addEventListener("submit", saveSettings);
 $("#scraper-config-form").addEventListener("submit", saveScraperConfig);
 $("#artwork-form").addEventListener("submit", saveArtwork);
+initSidebar();
+showTab("dashboard");
 refreshStatus();

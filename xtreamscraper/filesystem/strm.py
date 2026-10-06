@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 import logging
-from typing import Optional
 from urllib.parse import urlsplit
 
 from . import atomic
@@ -20,12 +19,20 @@ class WriteResult(enum.Enum):
     UNCHANGED = "unchanged"
 
 
-def normalize_url(text: str) -> str:
+def normalize_url(text: str | None) -> str:
     return (text or "").strip()
 
 
-def read_strm_url(path: str) -> Optional[str]:
-    """First non-empty, non-comment line of the file, or None when absent/unreadable/empty."""
+def read_strm_url(path: str) -> str | None:
+    """First non-empty, non-comment line of the file, or None when absent/unreadable/empty.
+
+    Contract:
+        Silences:
+            - Any ``OSError`` (missing file, folder, no access) gives ``None``, the same
+              answer as an empty file. Only the first 64 KiB are read.
+            - The line is returned as found; it is not checked to be a URL
+              (see ``is_usable_url``).
+    """
     try:
         content = atomic.read_text(path, max_bytes=64 * 1024)
     except OSError:
@@ -37,7 +44,13 @@ def read_strm_url(path: str) -> Optional[str]:
     return None
 
 
-def is_usable_url(url: Optional[str]) -> bool:
+def is_usable_url(url: str | None) -> bool:
+    """True for an http(s), rtmp, rtsp, rtp or udp URL with a host and no whitespace.
+
+    Contract:
+        Silences:
+            - A ``ValueError`` from ``urlsplit`` (e.g. a malformed IPv6 host) gives ``False``.
+    """
     if not url or any(c.isspace() for c in url):
         return False
     try:
@@ -48,7 +61,21 @@ def is_usable_url(url: Optional[str]) -> bool:
 
 
 def write_strm(path: str, url: str) -> WriteResult:
-    """Create or update the STRM so it holds exactly ``url``; untouched when already correct."""
+    """Create or update the STRM so it holds exactly ``url``; untouched when already correct.
+
+    The file holds the URL stripped of surrounding whitespace plus one newline.
+
+    Contract:
+        Preconditions:
+            - The caller owns ``path``: a different existing file there is overwritten.
+
+        Raises:
+            OSError: From the atomic write (see ``atomic_write_bytes``), not caught.
+
+        Silences:
+            - An ``OSError`` while reading the current file is treated as "different", and
+              the file is rewritten (``UPDATED``).
+    """
     desired = normalize_url(url)
     if atomic.is_file(path):
         try:

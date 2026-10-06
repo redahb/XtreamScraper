@@ -9,8 +9,9 @@ updated when the library moves.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional, TypedDict, TypeVar, Union
 
 from ..utils.timeutil import now_iso
 from .db import Database
@@ -84,11 +85,26 @@ class RefRecord:
     written_at: str
 
 
-def _build(cls, row) -> Any:
+_Record = TypeVar("_Record", bound=Union[SlotRecord, FileRecord, RefRecord])
+
+
+class ArtworkCounts(TypedDict):
+    """Artwork overview figures for the WebUI."""
+
+    slots: dict[str, int]  # slot status -> count
+    slot_total: int
+    managed_files: int
+    modified_files: int
+    nfo_refs: int
+
+
+def _build(cls: type[_Record], row: sqlite3.Row) -> _Record:
     return cls(**{k: row[k] for k in row.keys()})
 
 
 class ArtworkRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -134,7 +150,11 @@ class ArtworkRepository:
     def select(self, key: ItemKey, artwork_type: str, url: str, source_plugin: Optional[str],
                source_remote_id: Optional[str], language: Optional[str] = None, width: Optional[int] = None,
                height: Optional[int] = None) -> SlotRecord:
-        """Persist the selected candidate for a slot (``selected_at`` changes only with the URL/source)."""
+        """Persist the selected candidate for a slot (``selected_at`` changes only with the URL/source).
+
+        A new slot starts ``pending``; an existing slot keeps its ``status``, ``mode`` and
+        ``message`` (the caller updates them through :meth:`set_status`).
+        """
         now = now_iso()
         with self.db.transaction() as conn:
             conn.execute(
@@ -159,6 +179,14 @@ class ArtworkRepository:
 
     def set_status(self, slot_id: int, status: str, message: Optional[str] = None, mode: Optional[str] = None,
                    keep_mode: bool = False) -> None:
+        """Set the slot's status and message, and its mode unless ``keep_mode``.
+
+        Contract:
+            Preconditions:
+                - Without ``keep_mode=True`` the stored mode becomes ``mode``, so leaving
+                  ``mode`` out clears it to ``NULL``.
+                - ``message`` replaces the stored one (``None`` clears it).
+        """
         with self.db.transaction() as conn:
             if keep_mode:
                 conn.execute("UPDATE artwork_slots SET status = ?, message = ?, updated_at = ? WHERE id = ?",
@@ -169,11 +197,21 @@ class ArtworkRepository:
 
     # -- managed files -----------------------------------------------------------------------------
     def files(self, slot_id: int) -> list[FileRecord]:
+        """The slot's managed files, ``primary`` before ``alias`` (``role DESC``), then by ID."""
         rows = self.db.query("SELECT * FROM artwork_files WHERE slot_id = ? ORDER BY role DESC, id", (slot_id,))
         return [_build(FileRecord, r) for r in rows]
 
     def record_file(self, slot_id: int, role: str, path: str, file_hash: str, size: int, source_url: str,
                     source_plugin: Optional[str]) -> None:
+        """The application wrote ``path`` for this slot: it owns it, as ``managed``.
+
+        Contract:
+            Preconditions:
+                - ``path`` was just written by the application with content hashing to
+                  ``file_hash``. An existing row for the same slot and path is overwritten and
+                  set back to ``managed``, also when it was ``modified``.
+                - ``slot_id`` exists (foreign key, else ``sqlite3.IntegrityError``).
+        """
         now = now_iso()
         with self.db.transaction() as conn:
             conn.execute(
@@ -207,6 +245,8 @@ class ArtworkRepository:
         return [_build(RefRecord, r) for r in rows]
 
     def refs_at(self, nfo_path: str, location: str) -> list[RefRecord]:
+        """Owned NFO references at one NFO location, any slot. ``nfo_path`` is compared exactly
+        (no normalisation), so it must be spelled as it was recorded."""
         rows = self.db.query("SELECT * FROM artwork_nfo_refs WHERE nfo_path = ? AND location = ?", (nfo_path, location))
         return [_build(RefRecord, r) for r in rows]
 
@@ -234,11 +274,14 @@ class ArtworkRepository:
             conn.execute("DELETE FROM artwork_nfo_refs WHERE id = ?", (ref_id,))
 
     # -- overview ----------------------------------------------------------------------------------
-    def counts(self) -> dict[str, Any]:
+    def counts(self) -> ArtworkCounts:
+        """Slot counts per status, managed and modified file counts, and owned NFO references."""
         slots = {r["status"]: r["n"] for r in self.db.query(
             "SELECT status, COUNT(*) AS n FROM artwork_slots GROUP BY status")}
         files = {r["status"]: r["n"] for r in self.db.query(
             "SELECT status, COUNT(*) AS n FROM artwork_files GROUP BY status")}
-        refs = self.db.query_one("SELECT COUNT(*) AS n FROM artwork_nfo_refs")["n"]
+        row = self.db.query_one("SELECT COUNT(*) AS n FROM artwork_nfo_refs")
+        assert row is not None  # an aggregate query always returns one row
+        refs = row["n"]
         return {"slots": slots, "slot_total": sum(slots.values()), "managed_files": files.get(MANAGED, 0),
                 "modified_files": files.get(MODIFIED_EXTERNALLY, 0), "nfo_refs": refs}

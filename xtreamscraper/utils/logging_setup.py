@@ -47,7 +47,23 @@ memory_handler = MemoryLogHandler()
 
 
 def setup_logging(log_dir: str, level: str = "INFO", console: bool = True) -> str:
-    """Configure the root logger. Returns the log file path."""
+    """Configure the root logger. Returns the log file path.
+
+    Contract:
+        Preconditions:
+            - Replaces (and closes) every handler already on the root logger, so it is meant
+              to be called once at start-up (or again in tests).
+
+        Raises:
+            OSError: When ``log_dir`` cannot be created (from ``os.makedirs``). The log file
+                itself is opened lazily (``delay=True``), so a file that cannot be written fails
+                on the first record, through ``logging``'s own error handling.
+
+        Silences:
+            - ``ValueError`` from ``sys.stderr.reconfigure`` and a stderr without it (None
+              under pythonw): the console keeps its own error handling.
+            - An invalid ``level`` name gives INFO (see :func:`set_level`).
+    """
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, LOG_FILE_NAME)
     root = logging.getLogger()
@@ -63,11 +79,14 @@ def setup_logging(log_dir: str, level: str = "INFO", console: bool = True) -> st
     root.addHandler(file_handler)
     root.addHandler(memory_handler)
     if console:
-        try:
-            # A Windows console code page cannot show every title; never fail on that.
-            sys.stderr.reconfigure(errors="backslashreplace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError):
-            pass
+        # A Windows console code page cannot show every title; never fail on that. stderr may
+        # be None (pythonw) or a replacement stream without reconfigure().
+        reconfigure = getattr(sys.stderr, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="backslashreplace")
+            except ValueError:
+                pass
         stream = logging.StreamHandler()
         stream.setFormatter(formatter)
         root.addHandler(stream)
@@ -79,10 +98,20 @@ def setup_logging(log_dir: str, level: str = "INFO", console: bool = True) -> st
 
 
 def set_level(level: Optional[str]) -> None:
+    """Set the root logger level from a level name (any case); ``None``, empty or unknown names
+    (and ``logging`` attributes that are not levels) give INFO without an error."""
     value = getattr(logging, str(level or "INFO").upper(), logging.INFO)
+    if isinstance(value, bool) or not isinstance(value, int):  # e.g. logging.BASIC_FORMAT
+        value = logging.INFO
     logging.getLogger().setLevel(value)
 
 
 def recent_lines(limit: int = 200) -> list[str]:
+    """The newest ``limit`` redacted lines kept for the WebUI (oldest first); none for ``limit <= 0``.
+
+    At most the handler's capacity (500) lines are kept.
+    """
+    if limit <= 0:
+        return []  # lines[-0:] would be every line
     lines = list(memory_handler.lines)
     return lines[-limit:]

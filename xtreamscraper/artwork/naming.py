@@ -118,7 +118,17 @@ class LocalName:
 
 
 def local_names(target: ArtworkTarget, art_type: ArtworkType, aliases: bool = True) -> list[LocalName]:
-    """Canonical local file names for ``art_type`` of ``target``; the primary name first."""
+    """Canonical local file names for ``art_type`` of ``target``; the primary name first.
+
+    Contract:
+        Preconditions:
+            - ``art_type`` may also be an ``ArtworkType`` value string; an unknown string
+              raises ``ValueError`` (implicit, from ``ArtworkType(...)``).
+
+        Silences:
+            - A type the item kind has no local file for (or an episode without a ``stem``)
+              gives ``[]``; callers treat that as "no local representation".
+    """
     art_type = ArtworkType(art_type)
     names: list[LocalName] = []
     if target.item_kind in (MOVIE, SERIES) and art_type in _ROOT_NAMES:
@@ -136,21 +146,65 @@ def all_local_names(target: ArtworkTarget, art_type: ArtworkType) -> list[LocalN
     return local_names(target, art_type, aliases=True)
 
 
-def existing_variants(base: str) -> list[str]:
-    """Existing image files named ``base`` + any image extension (case-insensitive)."""
-    directory, stem = os.path.split(base)
+class DirectoryListings:
+    """Directory listings cached for one short operation (one ``os.listdir`` per folder).
+
+    Whoever writes or deletes a file in a listed folder while the cache is in use calls
+    :meth:`invalidate` for that folder.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, list[str]] = {}
+
+    @staticmethod
+    def _key(directory: str) -> str:
+        return os.path.normcase(os.path.abspath(directory))
+
+    def entries(self, directory: str) -> list[str]:
+        key = self._key(directory)
+        cached = self._entries.get(key)
+        if cached is None:
+            cached = self._entries[key] = _list_directory(directory)
+        return cached
+
+    def invalidate(self, directory: str) -> None:
+        self._entries.pop(self._key(directory), None)
+
+
+def _list_directory(directory: str) -> list[str]:
     try:
-        entries = os.listdir(atomic.fs_path(directory))
+        return os.listdir(atomic.fs_path(directory))
     except OSError:
         return []
+
+
+def existing_variants(base: str, listings: Optional[DirectoryListings] = None) -> list[str]:
+    """Existing image files named ``base`` + any image extension (case-insensitive).
+
+    ``listings`` reuses one directory listing for several names in the same folder.
+
+    Contract:
+        Silences:
+            - A missing or unreadable folder gives ``[]`` (``OSError`` from ``os.listdir``),
+              which reads as "no artwork here". A write that follows into such a folder fails
+              on its own.
+            - With ``listings`` the answer is only as fresh as the cached listing; whoever
+              writes or deletes in the folder must invalidate it.
+    """
+    directory, stem = os.path.split(base)
+    entries = listings.entries(directory) if listings is not None else _list_directory(directory)
     folded = stem.casefold()
     return sorted(os.path.join(directory, e) for e in entries
                   if os.path.splitext(e)[0].casefold() == folded and os.path.splitext(e)[1].lower() in IMAGE_EXTENSIONS)
 
 
 def nfo_locations(target: ArtworkTarget, art_type: ArtworkType) -> list[tuple[str, NfoKind, RefLocation]]:
-    """NFO locations for a remote reference; the item's own NFO first."""
-    result = []
+    """NFO locations for a remote reference; the item's own NFO first.
+
+    A season poster is also referenced from the show's ``tvshow.nfo`` (``<thumb season=N>``).
+    An empty list means the type has no NFO representation for this item.
+    """
+    result: list[tuple[str, NfoKind, RefLocation]] = []
     own = location_for(target.nfo_kind, art_type)
     if own is not None:
         result.append((target.nfo_path, target.nfo_kind, own))

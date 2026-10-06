@@ -61,12 +61,19 @@ class TitleMatcher:
         return ScoredCandidate(candidate, round(best_score, 2), adjustment, round(final, 2), best_title)
 
     @staticmethod
-    def _order_key(scored: ScoredCandidate) -> tuple:
+    def _order_key(scored: ScoredCandidate) -> tuple[float, float, float, float, str]:
         popularity = scored.candidate.popularity if scored.candidate.popularity is not None else -1.0
         return (-scored.score, -scored.title_score, -scored.year_adjustment, -popularity,
                 str(scored.candidate.remote_id))
 
     def rank(self, title: str, year: Optional[int], candidates: Iterable[MatchCandidate]) -> list[ScoredCandidate]:
+        """Score and order ``candidates`` deterministically, best first.
+
+        Contract:
+            Preconditions:
+                - Candidates are the same item when ``str(remote_id)`` is equal (``603`` and
+                  ``"603"`` too); only the best-ordered listing of each is kept.
+        """
         best: dict[str, ScoredCandidate] = {}
         for candidate in candidates:
             scored = self.score(title, year, candidate)
@@ -85,6 +92,13 @@ class TitleMatcher:
 
         For plugins that must drop some ranked candidates first (e.g. after confirming each
         one's media type): the kept candidates keep their shared scores and order.
+
+        Contract:
+            Preconditions:
+                - ``ranked`` was scored by a matcher with this matcher's profile; the
+                  ambiguity margin of *this* profile is applied.
+            Silences:
+                - An empty list is ``unmatched`` ("no candidates"), never an error.
         """
         ranked = sorted(ranked, key=self._order_key)
         if not ranked:

@@ -36,6 +36,17 @@ class RefLocation:
 
     @classmethod
     def from_key(cls, key: str) -> "RefLocation":
+        """The inverse of :attr:`key` (keys are stored in the DB by the artwork manager).
+
+        Contract:
+            Raises:
+                ValueError: ``season=`` is followed by something that is not an integer
+                    (implicit, from ``int()``).
+            Silences:
+                - Any other unexpected key becomes a root ``<thumb>`` location: a key without
+                  ``:`` gives the plain ``<thumb>`` (aspect ``""``) and a third part not
+                  starting with ``season=`` is ignored.
+        """
         if key == "fanart":
             return cls(container="fanart")
         parts = key.split(":")
@@ -46,7 +57,12 @@ class RefLocation:
 
 
 def location_for(nfo_kind: NfoKind, art_type: ArtworkType, season: Optional[int] = None) -> Optional[RefLocation]:
-    """The NFO location of ``art_type`` in an NFO of ``nfo_kind`` (None = not representable)."""
+    """The NFO location of ``art_type`` in an NFO of ``nfo_kind`` (None = not representable).
+
+    Contract:
+        Raises:
+            ValueError: ``art_type`` is a string that is not an :class:`ArtworkType` value.
+    """
     art_type = ArtworkType(art_type)
     if art_type is ArtworkType.FANART:
         return RefLocation(container="fanart") if nfo_kind in (NfoKind.MOVIE, NfoKind.TVSHOW) else None
@@ -94,7 +110,14 @@ def _insert_position(root: ET.Element, tag: str) -> int:
 
 
 def add_ref(doc: NfoDocument, loc: RefLocation, url: str) -> bool:
-    """Add a reference unless the same URL is already at that location. Returns changed."""
+    """Add a reference unless the same URL is already at that location. Returns changed.
+
+    Contract:
+        Silences:
+            - A blank ``url`` adds nothing and returns ``False``.
+            - The URL is compared after stripping; an existing reference with the same URL in
+              another location (e.g. another aspect) does not count.
+    """
     url = url.strip()
     if not url or url in find_urls(doc, loc):
         return False
@@ -115,7 +138,11 @@ def add_ref(doc: NfoDocument, loc: RefLocation, url: str) -> bool:
 
 
 def remove_ref(doc: NfoDocument, loc: RefLocation, url: str) -> bool:
-    """Remove the reference(s) at ``loc`` with exactly this URL. Returns changed."""
+    """Remove the reference(s) at ``loc`` with exactly this URL. Returns changed.
+
+    Only elements at ``loc`` whose stripped text equals the stripped ``url`` are removed;
+    a ``<fanart>`` container left empty is removed too.
+    """
     url = url.strip()
     changed = False
     for parent, el in _elements(doc, loc):

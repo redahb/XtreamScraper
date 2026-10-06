@@ -25,7 +25,16 @@ def needs_probe(
     force: bool = False,
     now: Optional[datetime] = None,
 ) -> tuple[bool, str]:
-    """Return ``(should_probe, reason)``."""
+    """Return ``(should_probe, reason)``.
+
+    Contract:
+        Preconditions:
+            - ``url_hash`` must be computed like ``record.url_hash`` (``url_fingerprint``);
+              any difference counts as a changed URL and probes again.
+        Silences:
+            - A missing or unparseable ``last_attempt_at`` counts as old enough to retry; a
+              successful record without ``last_success_at`` is treated like a failed one.
+    """
     now = now or utcnow()
     if force:
         return True, "forced"

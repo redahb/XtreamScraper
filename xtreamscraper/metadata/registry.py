@@ -40,7 +40,9 @@ def add_plugin_path(directory: str) -> None:
 
 
 def _same_file(a: Optional[str], b: str) -> bool:
-    return bool(a) and os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    if not a:
+        return False
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
 class PluginRegistry:
@@ -49,6 +51,16 @@ class PluginRegistry:
         self._lock = threading.Lock()
 
     def register(self, plugin: ScraperPlugin | Type[ScraperPlugin]) -> ScraperPlugin:
+        """Install a plugin instance (a class is instantiated without arguments).
+
+        Contract:
+            Raises:
+                ValueError: Empty ``plugin_id`` (explicit).
+                Exception: Whatever the plugin's constructor raises (not caught here).
+            Silences:
+                - A plugin with the ``plugin_id`` of an installed one replaces it (info log).
+                - ``id_namespace`` is not validated or lower-cased.
+        """
         instance = plugin() if inspect.isclass(plugin) else plugin
         if not instance.plugin_id:
             raise ValueError("Scraper plugin needs a non-empty plugin_id")
@@ -69,7 +81,13 @@ class PluginRegistry:
             return list(self._plugins.values())
 
     def discover(self, directory: str) -> int:
-        """Load every plugin file and plugin folder in ``directory``; returns how many plugins registered."""
+        """Load every plugin file and plugin folder in ``directory``; returns how many plugins registered.
+
+        Contract:
+            Silences:
+                - A missing directory gives 0; names starting with ``_`` or ``.`` are skipped.
+                - A plugin that fails to import or register is logged and skipped.
+        """
         if not os.path.isdir(directory):
             return 0
         count = 0
@@ -98,7 +116,16 @@ class PluginRegistry:
         return self._register_from(module)
 
     def load_package(self, path: str) -> int:
-        """Import a plugin folder (``plugins/<name>/__init__.py``) as ``xtreamscraper_plugins.<name>``."""
+        """Import a plugin folder (``plugins/<name>/__init__.py``) as ``xtreamscraper_plugins.<name>``.
+
+        Contract:
+            Silences:
+                - A folder name that is not a Python identifier, or one already loaded from
+                  another path: a warning, 0.
+                - Any exception while importing: logged, every partly imported submodule is
+                  removed from ``sys.modules``, 0. An already imported package is not imported
+                  again; its classes are registered again.
+        """
         path = os.path.abspath(path)
         name = os.path.basename(path)
         if not name.isidentifier():

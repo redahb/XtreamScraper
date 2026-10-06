@@ -102,7 +102,14 @@ def parse_subtitle(el: ET.Element) -> SubtitleStreamInfo:
 
 
 def parse_media_info(source: Union[NfoDocument, ET.Element]) -> MediaInfo:
-    """Media information of an NFO document (or its root element). Never raises for content."""
+    """Media information of an NFO document (or its root element). Never raises for content.
+
+    Contract:
+        Silences:
+            - Every field that is missing, malformed or not in the approved vocabulary is
+              ``None`` (or dropped from a flag list); the caller cannot tell "absent" from
+              "unreadable". Several ``<streamdetails>`` blocks are concatenated.
+    """
     root = source.root if isinstance(source, NfoDocument) else source
     media = MediaInfo()
     for details in root.findall("fileinfo/streamdetails"):

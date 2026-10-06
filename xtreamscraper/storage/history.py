@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -20,7 +21,14 @@ MAX_DETAIL_MESSAGES = 200  # warnings/errors kept per job
 DETAILED_JOBS_PER_PROVIDER = 20  # older jobs keep counters but lose message lists
 
 
-def _decode(row) -> dict[str, Any]:
+def _decode(row: sqlite3.Row) -> dict[str, Any]:
+    """A history row as a dict with its JSON columns decoded.
+
+    Contract:
+        Silences:
+            - Unparseable ``stats`` reads as ``{}``; unparseable ``warnings`` / ``errors`` /
+              ``plugins`` as ``[]``.
+    """
     data = dict(row)
     for key in ("stats", "warnings", "errors", "plugins"):
         if key not in data:
@@ -35,11 +43,20 @@ def _decode(row) -> dict[str, Any]:
 class _HistoryBase:
     table = ""
     summary_columns: tuple[str, ...] = ()
+    db: Database
 
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def start(self, job_id: str, provider_id: Optional[int], provider_name: str, started_at: str, **extra) -> int:
+    def start(self, job_id: str, provider_id: Optional[int], provider_name: str, started_at: str, **extra: Any) -> int:
+        """Insert a ``running`` row for a job that is starting; returns its row ID.
+
+        Contract:
+            Preconditions:
+                - The keys of ``extra`` are column names of :attr:`table` written into the SQL
+                  text: they must come from code, never from user input. An unknown column
+                  raises ``sqlite3.OperationalError``.
+        """
         columns = ["job_id", "provider_id", "provider_name", "status", "started_at", *extra.keys()]
         values = [job_id, provider_id, provider_name, "running", started_at, *extra.values()]
         with self.db.transaction() as conn:
@@ -47,7 +64,9 @@ class _HistoryBase:
                 f"INSERT INTO {self.table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in values)})",
                 values,
             )
-            return int(cur.lastrowid)
+            row_id = cur.lastrowid
+            assert row_id is not None  # set by every successful INSERT
+            return row_id
 
     def finish(
         self,
@@ -60,6 +79,19 @@ class _HistoryBase:
         errors: list[str],
         summary: dict[str, int],
     ) -> None:
+        """Record a job's outcome on its row.
+
+        Contract:
+            Preconditions:
+                - ``stats`` is JSON-serialisable (else ``TypeError``; nothing is written).
+                - ``summary`` values convert with ``int()`` (else ``ValueError``/``TypeError``).
+            Silences:
+                - Only the first :data:`MAX_DETAIL_MESSAGES` warnings and errors are stored
+                  (the counts are the full lengths).
+                - ``summary`` keys that are not in :attr:`summary_columns` are dropped without
+                  notice (a misspelt key leaves that counter at 0).
+                - An unknown ``row_id`` updates nothing.
+        """
         assignments = {
             "status": status,
             "finished_at": finished_at,
@@ -76,6 +108,8 @@ class _HistoryBase:
             conn.execute(f"UPDATE {self.table} SET {sql} WHERE id = ?", (*assignments.values(), row_id))
 
     def list(self, provider_id: Optional[int] = None, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of jobs, newest first, without the message lists (``plugins`` decoded,
+        ``[]`` when it does not parse)."""
         columns = (
             "id, job_id, provider_id, provider_name, status, started_at, finished_at, duration_seconds, "
             "warning_count, error_count, " + ", ".join(self.summary_columns) + self._extra_list_columns()
@@ -130,6 +164,15 @@ class _HistoryBase:
         * Only the newest ``keep_per_provider`` jobs per provider are kept at all.
         * Beyond the newest :data:`DETAILED_JOBS_PER_PROVIDER`, message lists are pruned
           (counters are kept, so aggregate numbers stay visible).
+
+        Rows without a provider count as one group. Returns the number of deleted rows.
+
+        Contract:
+            Preconditions:
+                - ``keep_per_provider`` >= 1 (the settings enforce >= 5). With 0, every row of
+                  every provider is deleted, the latest and ``running`` ones included; a
+                  negative value keeps all but that many oldest rows.
+                - Age deletion never removes a ``running`` row, but the per-provider cap does.
         """
         cutoff = to_iso(utcnow() - timedelta(days=max_age_days))
         removed = 0

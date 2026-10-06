@@ -52,7 +52,14 @@ def _clean(value: Any) -> Optional[str]:
 
 
 def positive_int(value: Any) -> Optional[int]:
-    """Positive integer from ints, numeric strings or integral floats; else ``None``."""
+    """Positive integer from ints, numeric strings or integral floats; else ``None``.
+
+    Contract:
+        Silences:
+            - Non-integral values are truncated (``1.9`` -> ``1``); values below 1, booleans,
+              non-finite numbers, placeholders (``"N/A"``, ``"0/0"``) and unparseable text
+              give ``None``.
+    """
     text = _clean(value)
     if text is None:
         return None
@@ -60,9 +67,10 @@ def positive_int(value: Any) -> Optional[int]:
         number = float(text)
     except ValueError:
         return None
-    if not math.isfinite(number) or number <= 0:
+    if not math.isfinite(number):
         return None
-    return int(number)
+    result = int(number)  # truncates: 0.5 -> 0, which is not positive
+    return result if result > 0 else None
 
 
 def positive_float(value: Any) -> Optional[float]:
@@ -77,7 +85,14 @@ def positive_float(value: Any) -> Optional[float]:
 
 
 def parse_ratio(value: Any) -> Optional[Fraction]:
-    """``"16:9"`` / ``"24000/1001"`` / ``"1.78"`` -> positive Fraction, else ``None``."""
+    """``"16:9"`` / ``"24000/1001"`` / ``"1.78"`` -> positive Fraction, else ``None``.
+
+    Contract:
+        Silences:
+            - Zero or negative parts, a zero denominator, unparseable text and ratios too
+              large for a float give ``None``. A plain decimal is limited to a denominator of
+              100000. Very long exponents (``"1e2000000:1"``) are parsed exactly and are slow.
+    """
     text = _clean(value)
     if text is None:
         return None
@@ -90,9 +105,17 @@ def parse_ratio(value: Any) -> Optional[Fraction]:
                 return None
             if numerator <= 0 or denominator <= 0:
                 return None
-            return numerator / denominator
+            ratio = numerator / denominator
+            try:
+                float(ratio)
+            except OverflowError:  # "1e400:1": every caller needs it as a float
+                return None
+            return ratio
     number = positive_float(text)
-    return Fraction(number).limit_denominator(100000) if number else None
+    if not number:
+        return None
+    ratio = Fraction(number).limit_denominator(100000)
+    return ratio if ratio > 0 else None  # below 1/200000 the limited fraction is 0
 
 
 def tri_state(value: Any) -> Optional[bool]:
@@ -127,7 +150,13 @@ def normalize_codec(value: Any, codec_tag: Any = None) -> Optional[str]:
 
 
 def normalize_language(value: Any) -> Optional[str]:
-    """Three-letter ISO 639 code. ``en``/``en-US`` -> ``eng``; ``und`` is kept; junk -> ``None``."""
+    """Three-letter ISO 639 code. ``en``/``en-US`` -> ``eng``; ``und`` is kept; junk -> ``None``.
+
+    Contract:
+        Silences:
+            - Any three ASCII letters are accepted unchecked (``"xyz"``); a two-letter code
+              outside the built-in table and every other form give ``None``.
+    """
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip().lower()

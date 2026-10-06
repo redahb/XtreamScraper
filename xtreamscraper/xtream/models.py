@@ -25,7 +25,8 @@ class VodStream:
     rating: Optional[str] = None
     icon: Optional[str] = None
     tmdb_id: Optional[str] = None
-    extra: dict[str, Any] = field(default_factory=dict)
+    # Unknown scalar fields of the provider record, kept as they came.
+    extra: dict[str, str | int | float] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,6 +75,8 @@ class SeriesDetails:
     seasons: list[SeasonInfo] = field(default_factory=list)
     episodes: list[Episode] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Episodes the answer lists but that could not be parsed: kept as they are, never missing.
+    unparsed_episode_ids: set[str] = field(default_factory=set)
 
 
 @dataclass

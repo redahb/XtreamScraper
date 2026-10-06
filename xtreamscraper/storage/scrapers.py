@@ -8,8 +8,9 @@ configuration are stored in plain text in the local database, like provider pass
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence, TypedDict, cast
 
 from ..utils.timeutil import now_iso
 from .db import Database
@@ -32,6 +33,25 @@ OVERVIEW_FILTERS = (UNMATCHED, AMBIGUOUS, INVALID_BINDING, NOT_FOUND, MATCHED, "
 #: SQL: binding ``b`` holds a match (an API error keeps the stored match).
 HAS_MATCH = "(b.status = 'matched' OR (b.status = 'api_error' AND COALESCE(b.remote_id, '') != ''))"
 ROOT_KINDS = ("movie", "series")
+
+#: ``(plugin_id, item_kind, provider_id, category_id, item_id)``: :attr:`Binding.key`.
+BindingKey = tuple[str, str, int, str, str]
+#: ``(item_kind, provider_id, category_id, item_id)``: one item, whichever plugin (note the order
+#: differs from the artwork/NFO ``ItemKey``).
+BindingItemKey = tuple[str, int, str, str]
+
+
+class OverviewRow(TypedDict):
+    """One root item listed by :meth:`ScraperStateRepository.root_overview`."""
+
+    kind: str  # movie | series
+    provider_id: int
+    category_id: str
+    item_id: str
+    title: str
+    year: Optional[int]
+    provider_name: str
+    category_name: Optional[str]  # None when the category row is gone
 
 
 @dataclass
@@ -62,7 +82,7 @@ class Binding:
     last_successful_scrape: Optional[str] = None
     last_attempt: Optional[str] = None
     message: Optional[str] = None
-    candidates: list[dict] = field(default_factory=list)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
     config_fingerprint: Optional[str] = None
     #: IDs the user entered by hand and confirmed for this match (``{namespace: value}``): the
     #: native remote ID plus the alternate ID it was found with. Empty for automatic matches.
@@ -73,14 +93,25 @@ class Binding:
         return bool(self.manual_ids)
 
     @property
-    def key(self) -> tuple:
+    def key(self) -> BindingKey:
         return (self.plugin_id, self.item_kind, self.provider_id, self.category_id, self.item_id)
 
 
 _BINDING_KEYS = ("plugin_id", "item_kind", "provider_id", "category_id", "item_id")
 
 
+def _json_dict(text: str) -> dict[str, Any]:
+    """A stored JSON object; unreadable JSON or any other JSON value reads as ``{}``."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class ScraperStateRepository:
+    db: Database
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -131,6 +162,13 @@ class ScraperStateRepository:
 
     # -- plugin configuration ------------------------------------------------------------------
     def get_config(self, plugin_id: str) -> dict[str, Any]:
+        """The plugin's stored settings (secrets included: never send this to the browser).
+
+        Contract:
+            Silences:
+                - Stored JSON that does not parse, or is not an object, reads as ``{}``, the
+                  same as "never configured".
+        """
         row = self.db.query_one("SELECT config FROM scraper_config WHERE plugin_id = ?", (plugin_id,))
         if row is None:
             return {}
@@ -150,24 +188,31 @@ class ScraperStateRepository:
 
     # -- plugin status -------------------------------------------------------------------------
     def get_status(self, plugin_id: str) -> dict[str, Any]:
+        """The plugin's stored status; ``{}`` when there is none or it does not parse as an object."""
         row = self.db.query_one("SELECT status, updated_at FROM scraper_status WHERE plugin_id = ?", (plugin_id,))
-        if row is None:
-            return {}
-        try:
-            data = json.loads(row["status"])
-        except ValueError:
-            return {}
-        return data if isinstance(data, dict) else {}
+        return _json_dict(row["status"]) if row is not None else {}
 
     def update_status(self, plugin_id: str, values: dict[str, Any]) -> dict[str, Any]:
-        """Merge ``values`` into the stored status (a ``None`` value removes that entry)."""
-        status = self.get_status(plugin_id)
-        for key, value in values.items():
-            if value is None:
-                status.pop(key, None)
-            else:
-                status[key] = value
+        """Merge ``values`` into the stored status (a ``None`` value removes that entry).
+
+        The read and the write share one write transaction, so concurrent updates for the same
+        plugin are serialised and never lose each other's entries.
+
+        Contract:
+            Preconditions:
+                - Values are JSON-serialisable (else ``TypeError`` from ``json.dumps``; nothing
+                  is written) and contain no secrets (shown on the plugin page).
+            Silences:
+                - A stored status that does not parse is replaced by ``values`` alone.
+        """
         with self.db.transaction() as conn:
+            row = conn.execute("SELECT status FROM scraper_status WHERE plugin_id = ?", (plugin_id,)).fetchone()
+            status = _json_dict(row["status"]) if row is not None else {}
+            for key, value in values.items():
+                if value is None:
+                    status.pop(key, None)
+                else:
+                    status[key] = value
             conn.execute(
                 "INSERT INTO scraper_status(plugin_id, status, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(plugin_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
@@ -185,12 +230,21 @@ class ScraperStateRepository:
         )
         return self._binding(row) if row else None
 
-    def bindings_for_provider(self, provider_id: int) -> dict[tuple, Binding]:
+    def bindings_for_provider(self, provider_id: int) -> dict[BindingKey, Binding]:
         rows = self.db.query("SELECT * FROM scraper_bindings WHERE provider_id = ?", (provider_id,))
         return {b.key: b for b in (self._binding(r) for r in rows)}
 
     @staticmethod
-    def _binding(row) -> Binding:
+    def _binding(row: sqlite3.Row) -> Binding:
+        """Build a :class:`Binding` from a ``scraper_bindings`` row.
+
+        Contract:
+            Silences:
+                - Unparseable ``candidates`` JSON reads as ``[]``.
+                - Unparseable or non-object ``manual_ids`` reads as ``{}``, and entries with an
+                  empty namespace or value are dropped: a corrupt row silently loses its manual
+                  lock, with no log. Keys and values are turned into ``str``.
+        """
         data = {f.name: row[f.name] for f in fields(Binding)}
         try:
             data["candidates"] = json.loads(data["candidates"] or "[]")
@@ -204,6 +258,16 @@ class ScraperStateRepository:
         return Binding(**data)
 
     def save_binding(self, binding: Binding) -> None:
+        """Insert or overwrite the binding (whole record, keyed by :attr:`Binding.key`).
+
+        Contract:
+            Preconditions:
+                - ``binding`` carries every field the caller wants kept (e.g. ``manual_ids``):
+                  the stored row is overwritten, not merged.
+                - ``candidates`` and ``manual_ids`` are JSON-serialisable (else ``TypeError``).
+            Silences:
+                - Only the first 10 ``candidates`` are stored; the rest are dropped.
+        """
         data = asdict(binding)
         data["candidates"] = json.dumps(data["candidates"][:10])
         data["manual_ids"] = json.dumps(data["manual_ids"] or {}, sort_keys=True)
@@ -229,8 +293,12 @@ class ScraperStateRepository:
             "ORDER BY plugin_id", (item_kind, provider_id, category_id, item_id))
         return [self._binding(r) for r in rows]
 
-    def bindings_for_items(self, keys: list[tuple]) -> list[Binding]:
-        """The bindings of every plugin for the given ``(item_kind, provider_id, category_id, item_id)`` keys."""
+    def bindings_for_items(self, keys: Sequence[BindingItemKey]) -> list[Binding]:
+        """The bindings of every plugin for the given ``(item_kind, provider_id, category_id, item_id)`` keys.
+
+        Queried 200 keys at a time (4 parameters each, under SQLite's historical limit of 999).
+        Keys in another order (e.g. an artwork ``ItemKey``) match nothing, silently.
+        """
         result: list[Binding] = []
         for start in range(0, len(keys), 200):
             chunk = keys[start:start + 200]
@@ -243,13 +311,25 @@ class ScraperStateRepository:
 
     def root_overview(self, plugin_ids: list[str], status: str = UNMATCHED, provider_id: Optional[int] = None,
                       item_kind: Optional[str] = None, title: str = "", limit: int = 50,
-                      offset: int = 0) -> tuple[int, list[dict]]:
+                      offset: int = 0) -> tuple[int, list[OverviewRow]]:
         """Active root items (movies and series, never seasons or episodes) in the requested state
         (see :data:`OVERVIEW_FILTERS`), judged on the bindings of ``plugin_ids`` only. Items no
-        plugin in scope has tried are never listed. Returns the total and one page of item rows."""
+        plugin in scope has tried are never listed. Returns the total and one page of item rows.
+
+        Contract:
+            Preconditions:
+                - ``status`` is one of :data:`OVERVIEW_FILTERS`; any other value is used as a
+                  binding status and simply matches nothing.
+                - ``item_kind`` outside :data:`ROOT_KINDS` (e.g. ``None``) means both kinds.
+                - ``title`` is matched as a case-insensitive substring (``LIKE`` wildcards in
+                  it are escaped); blank means no title filter.
+            Silences:
+                - An empty ``plugin_ids`` returns ``(0, [])`` without querying.
+        """
         if not plugin_ids:
             return 0, []
         negate = False
+        cond_params: tuple[str, ...]
         if status == "manual":
             condition, cond_params = "b.manual_ids NOT IN ('', '{}')", ()
         elif status == UNMATCHED:  # tried, but no plugin in scope holds a match
@@ -258,7 +338,8 @@ class ScraperStateRepository:
             condition, cond_params = HAS_MATCH, ()
         else:
             condition, cond_params = "b.status = ?", (status,)
-        where, params = ["1=1"], []
+        where: list[str] = ["1=1"]
+        params: list[int | str] = []
         if provider_id is not None:
             where.append("i.provider_id = ?")
             params.append(provider_id)
@@ -294,13 +375,36 @@ class ScraperStateRepository:
                   AND b.item_id = i.item_id AND b.plugin_id IN ({plugins}))
             """
             all_params += tuple(plugin_ids)
-        total = self.db.query_one(base.replace("{columns}", "COUNT(*) AS n"), all_params)["n"]
+        count = self.db.query_one(base.replace("{columns}", "COUNT(*) AS n"), all_params)
+        assert count is not None  # an aggregate query always returns one row
         rows = self.db.query(
             base.replace("{columns}", "i.kind, i.provider_id, i.category_id, i.item_id, i.title, i.year, "
                                 "p.name AS provider_name, c.name AS category_name")
             + " ORDER BY i.title COLLATE NOCASE, i.provider_id, i.kind, i.category_id, i.item_id LIMIT ? OFFSET ?",
             all_params + (int(limit), int(offset)))
-        return int(total), [dict(r) for r in rows]
+        return int(count["n"]), [cast(OverviewRow, dict(r)) for r in rows]
+
+    def root_match_summary(self, plugin_ids: list[str]) -> tuple[int, int]:
+        """``(matched, total)`` over active movies + series (never episodes): an item is matched
+        when one of ``plugin_ids`` (the enabled plugins) holds a match (see :data:`HAS_MATCH`),
+        the same rule as the Matching page. Never-scraped items count in the total only."""
+        plugins = ", ".join("?" for _ in plugin_ids)
+        match = f"""EXISTS (
+                SELECT 1 FROM scraper_bindings b
+                WHERE b.item_kind = i.kind AND b.provider_id = i.provider_id AND b.category_id = i.category_id
+                  AND b.item_id = i.item_id AND b.plugin_id IN ({plugins}) AND {HAS_MATCH})""" if plugin_ids else "0"
+        row = self.db.query_one(f"""
+            WITH items AS (
+                SELECT 'movie' AS kind, provider_id, category_id, stream_id AS item_id
+                FROM movies WHERE status = 'active'
+                UNION ALL
+                SELECT 'series' AS kind, provider_id, category_id, series_id AS item_id
+                FROM series WHERE status = 'active'
+            )
+            SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN {match} THEN 1 ELSE 0 END), 0) AS matched
+            FROM items i""", tuple(plugin_ids))
+        assert row is not None  # an aggregate query always returns one row
+        return int(row["matched"]), int(row["total"])
 
     def binding_counts(self, provider_id: Optional[int] = None) -> dict[str, dict[str, int]]:
         where, params = ("WHERE provider_id = ?", (provider_id,)) if provider_id is not None else ("", ())

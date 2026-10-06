@@ -56,7 +56,13 @@ def parse_year(value: Any) -> Optional[int]:
 
 
 def parse_date(value: Any) -> Optional[str]:
-    """``"24 Jun 1994"`` -> ``"1994-06-24"`` (English month names, independent of the locale)."""
+    """``"24 Jun 1994"`` -> ``"1994-06-24"`` (English month names, independent of the locale).
+
+    Contract:
+        Silences:
+            - ``ValueError`` from an impossible date (``"31 Feb 2000"``): returns ``None``, as for
+              any other unreadable value (other formats, unknown month names, ``N/A``).
+    """
     text = omdb_value(value)
     match = _DATE.match(text) if text else None
     if not match:
@@ -79,7 +85,11 @@ def parse_runtime(value: Any) -> Optional[int]:
 
 
 def parse_int(value: Any) -> Optional[int]:
-    """Vote counts: ``"1,248,136"`` -> 1248136."""
+    """Vote counts: ``"1,248,136"`` -> 1248136.
+
+    Groups of three digits may be separated by ``,``, ``.`` or whitespace; anything else
+    (``"1,24"``, ``"-5"``, ``"1e3"``) and zero give ``None``.
+    """
     text = omdb_value(value)
     if not text or not _VOTES.match(text):
         return None
@@ -92,7 +102,9 @@ def split_list(value: Any) -> list[str]:
     text = omdb_value(value)
     if not text:
         return []
-    parts, depth, current = [], 0, []
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
     for ch in text:
         if ch == "(":
             depth += 1
@@ -116,7 +128,7 @@ _ROLE = re.compile(r"^(.*?)\s*\(([^()]*)\)\s*$")
 
 
 def _people(value: Any, department: str, job: Optional[str]) -> Optional[list[PersonCredit]]:
-    result = []
+    result: list[PersonCredit] = []
     for entry in split_list(value):
         name, detail = entry, None
         match = _ROLE.match(entry)
@@ -133,7 +145,12 @@ def _actors(value: Any) -> Optional[list[PersonCredit]]:
 
 
 # -- ratings ------------------------------------------------------------------------------------------
-def _score(value: Any, pattern: re.Pattern, maximum: float) -> Optional[float]:
+def _score(value: Any, pattern: re.Pattern[str], maximum: float) -> Optional[float]:
+    """A rating in ``(0, maximum]`` read with ``pattern`` (``_PLAIN``, ``_PERCENT`` or ``_OUT_OF``).
+
+    For ``_OUT_OF`` the stated scale must equal ``maximum`` (``"8/10"`` for 10, not ``"4/5"``).
+    Anything else, zero and out-of-range values give ``None``.
+    """
     text = omdb_value(value)
     match = pattern.match(text) if text else None
     if not match:
@@ -150,9 +167,20 @@ def parse_ratings(data: dict[str, Any]) -> dict[str, Rating]:
 
     The dedicated fields and the ``Ratings`` list describe the same ratings; each source
     appears at most once. Unknown sources are ignored.
+
+    Contract:
+        Preconditions:
+            - ``data`` must be a mapping (``.get``; ``AttributeError`` otherwise).
+
+        Silences:
+            - Precedence: ``imdbRating`` over the list's IMDb entry, the list's Metacritic entry
+              over ``Metascore``; when a source is listed twice only the first entry counts.
+            - Unreadable values, a non-list ``Ratings`` and non-dict entries are skipped. The IMDb
+              vote count is attached only when ``imdbVotes`` parses.
     """
     listed: dict[str, Any] = {}
-    for entry in data.get("Ratings") or []:
+    entries = data.get("Ratings")
+    for entry in entries if isinstance(entries, list) else []:  # an oddly typed field is no ratings list
         if isinstance(entry, dict):
             source = (omdb_value(entry.get("Source")) or "").casefold()
             if source and source not in listed:
@@ -184,6 +212,18 @@ def map_details(data: dict[str, Any], media: MediaType, poster_ref: Optional[str
 
     ``poster_ref`` (movies/series only) marks the public poster as also available through the
     plugin's authenticated Poster API for local downloads.
+
+    Contract:
+        Preconditions:
+            - ``data`` must be a mapping (``.get``; ``AttributeError`` otherwise). It is not
+              checked against ``media``: the caller validates ``Type`` and the IMDb ID.
+
+        Silences:
+            - Every unreadable or ``N/A`` field is left unset; nothing is raised for odd values.
+            - A ``Poster`` that is not an ``http(s)`` URL gives no artwork. For an episode the
+              poster becomes an ``EPISODE_STILL`` and ``poster_ref`` is ignored.
+            - ``remote_id`` / ``external_ids`` come from the record's own ``imdbID`` (may be
+              ``None``); the plugin overwrites them for movies and series.
     """
     remote = imdb_id(data.get("imdbID"))
     ratings = parse_ratings(data)
@@ -241,13 +281,26 @@ class SeasonListing:
 
 
 def positive_int(value: Any) -> Optional[int]:
+    """A decimal-digit string above zero as ``int``, else ``None`` (never raises)."""
     text = omdb_value(value)
-    return int(text) if text and text.isdigit() and int(text) > 0 else None
+    return int(text) if text and text.isdecimal() and int(text) > 0 else None
 
 
 def parse_season_listing(data: dict[str, Any]) -> SeasonListing:
-    episodes = []
-    for entry in data.get("Episodes") or []:
+    """An ``i=<series>&Season=N`` answer as a :class:`SeasonListing`, episodes sorted by number.
+
+    Contract:
+        Preconditions:
+            - ``data`` must be a mapping (``.get``; ``AttributeError`` otherwise).
+
+        Silences:
+            - Entries that are not dicts or have no positive ``Episode`` number are dropped, and a
+              non-list ``Episodes`` gives no episodes: an incomplete listing, never an error.
+            - Duplicate episode numbers are all kept; ``SeasonListing.episode`` returns the first.
+    """
+    episodes: list[SeasonEpisode] = []
+    entries = data.get("Episodes")
+    for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict):
             continue
         number = positive_int(entry.get("Episode"))
@@ -257,5 +310,5 @@ def parse_season_listing(data: dict[str, Any]) -> SeasonListing:
                                       imdb_id(entry.get("imdbID")), _score(entry.get("imdbRating"), _PLAIN, 10.0)))
     episodes.sort(key=lambda e: e.number)
     season = omdb_value(data.get("Season"))
-    return SeasonListing(omdb_value(data.get("Title")), int(season) if season and season.isdigit() else None,
+    return SeasonListing(omdb_value(data.get("Title")), int(season) if season and season.isdecimal() else None,
                          positive_int(data.get("totalSeasons")), episodes)
