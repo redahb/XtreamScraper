@@ -1,8 +1,9 @@
-"""Minimal Canal+ NL HTTP client (the website's public Algolia search index, no account).
+"""Minimal Canal+ HTTP client (a country website's public Algolia search index, no account).
 
-* **Search settings:** ``https://www.canalplus.nl/stream/`` carries the public Algolia application
-  ID and *search-only* API key in an inline ``aa('init', {...})`` call. They are read at run time
-  (never hard-coded), cached for the whole process behind a lock and shared by all sessions. The
+* **Search settings:** the country website's stream page (:attr:`~.sites.Site.settings_url`, e.g.
+  ``https://www.canalplus.nl/stream/``) carries the public Algolia application ID and
+  *search-only* API key in an inline ``aa('init', {...})`` call. They are read at run time (never
+  hard-coded), cached per website for the whole process behind a lock and shared by all sessions. The
   key is shipped to every browser, but it is still registered with
   :func:`~xtreamscraper.utils.redact.register_secret` so it never reaches a log, an error or the
   database.
@@ -37,11 +38,13 @@ import requests
 from xtreamscraper.utils.http_retry import request_with_retries, user_agent
 from xtreamscraper.utils.redact import register_secret
 
+from .sites import NL, SITES, Site
+
 log = logging.getLogger(__name__)
 
-SITE_URL = "https://www.canalplus.nl/stream/"
-#: The Algolia index the website searches (provider configuration: it can change).
-INDEX = "prd_CANALPLUSNL_nl"
+#: The Dutch website's settings page and index (the default site).
+SITE_URL = NL.settings_url
+INDEX = NL.index
 MAX_RETRY_AFTER = 30.0
 MAX_CONCURRENT_REQUESTS = 2
 #: A failed search-settings discovery is not retried for this many seconds.
@@ -189,8 +192,9 @@ class CredentialCache:
             self._credentials, self._failure, self._failed_at = None, None, 0.0
 
 
-#: The process-wide cache used by default.
-CREDENTIALS = CredentialCache()
+#: The process-wide caches used by default, one per website.
+SITE_CREDENTIALS = {site.tag: CredentialCache() for site in SITES}
+CREDENTIALS = SITE_CREDENTIALS[NL.tag]
 
 
 # -- search answers -------------------------------------------------------------------------------
@@ -246,6 +250,7 @@ def parse_search(data: Any) -> SearchPage:
 class CanalPlusClient:
     session: requests.Session
     credentials: CredentialCache
+    site: Site
     timeout: tuple[float, float]
     retries: int
     backoff: float
@@ -256,16 +261,18 @@ class CanalPlusClient:
     def __init__(
         self,
         session: Optional[requests.Session] = None,
-        credentials: CredentialCache = CREDENTIALS,
+        credentials: Optional[CredentialCache] = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 30.0,
         retries: int = 3,
         backoff: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        site: Site = NL,
     ) -> None:
         self.session = session or requests.Session()
-        self.credentials = credentials
+        self.site = site
+        self.credentials = credentials if credentials is not None else SITE_CREDENTIALS[site.tag]
         self.timeout = (connect_timeout, read_timeout)
         self.retries = retries
         self.backoff = backoff
@@ -354,7 +361,7 @@ class CanalPlusClient:
                 CanalPlusAuthError: the page could not be loaded (network, 5xx, 429).
         """
         try:
-            response = self._send("GET", SITE_URL, "website", {"Accept": "text/html"})
+            response = self._send("GET", self.site.settings_url, "website", {"Accept": "text/html"})
         except CanalPlusError as exc:
             if exc.status is not None and 400 <= exc.status < 500 and exc.status != 429:
                 log.warning("Canal+ website answered HTTP %d instead of the search settings", exc.status)
@@ -373,7 +380,7 @@ class CanalPlusClient:
 
     def _algolia(self, method: str, path: str, context: str, body: Optional[dict[str, Any]] = None
                  ) -> dict[str, Any]:
-        """One Algolia request on :data:`INDEX`; on 401/403 rediscover the settings and retry once.
+        """One Algolia request on the site's index; on 401/403 rediscover the settings and retry once.
 
         Contract:
             Raises:
@@ -386,7 +393,7 @@ class CanalPlusClient:
             credentials = self.search_credentials()
             headers = {"Accept": "application/json", "X-Algolia-API-Key": credentials.api_key,
                        "X-Algolia-Application-Id": credentials.app_id}
-            url = f"{credentials.host}/1/indexes/{INDEX}{path}"
+            url = f"{credentials.host}/1/indexes/{self.site.index}{path}"
             try:
                 response = self._send(method, url, context, headers, body, unauthorized=True)
             except _Unauthorized as exc:

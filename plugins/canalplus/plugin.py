@@ -1,4 +1,4 @@
-"""Canal+ Netherlands scraper plugin.
+"""Canal+ scraper plugin (the Canal+ websites of the Netherlands, Austria, Czechia, Slovakia and Hungary).
 
 Responsibilities: Canal+ request behaviour (public search settings, the Algolia search index),
 candidate retrieval, the media kind of each record (from its page address), series families
@@ -43,7 +43,6 @@ from .parsing import (
     SEASON,
     SERIES,
     SHOW,
-    SITE_HOST,
     SeriesFamily,
     build_family,
     canonical_path,
@@ -53,6 +52,7 @@ from .parsing import (
     season_episode,
     series_root,
 )
+from .sites import DEFAULT, SITE_TAGS, SITES, site_for
 
 log = logging.getLogger(__name__)
 
@@ -69,10 +69,12 @@ MAX_FAMILY_PAGES = 10
 PAGE_NAMESPACE = "canalplus_page"
 KIND_LABEL = {MOVIE: "movie", SERIES: "series"}
 RATE_LIMITED = 429
+CHOOSE_LABEL = "Choose a country…"
+NOT_CONFIGURED_MESSAGE = "Choose a country first"
 
 
 def _default_client(config: dict[str, Any]) -> CanalPlusClient:
-    return CanalPlusClient()
+    return CanalPlusClient(site=site_for(config.get("country")))
 
 
 def _searchable(title: Optional[str]) -> bool:
@@ -84,6 +86,7 @@ class CanalPlusSession(ScraperSession):
 
     def __init__(self, client: CanalPlusClient, config: dict[str, Any], matcher: TitleMatcher) -> None:
         self.client = client
+        self.site = site_for(config.get("country"))
         self.threshold = float(config.get("threshold") if config.get("threshold") is not None else 85)
         self.matcher = matcher
         self._records: dict[str, dict[str, Any]] = {}
@@ -114,9 +117,8 @@ class CanalPlusSession(ScraperSession):
         return FetchOutcome.provider_format_error(message) if format_error else FetchOutcome.error(message)
 
     # -- matching ------------------------------------------------------------------------------------
-    @staticmethod
-    def _wanted(hit: dict[str, Any], kind: str) -> bool:
-        return kind_of(hit) == kind and not (kind == MOVIE and is_trailer_page(hit))
+    def _wanted(self, hit: dict[str, Any], kind: str) -> bool:
+        return kind_of(hit, self.site) == kind and not (kind == MOVIE and is_trailer_page(hit, self.site))
 
     def _decide(self, query: MatchQuery, kind: str) -> MatchDecision:
         """Search pages 0-2 of ``type:show`` records, keep those of ``kind`` and let the shared matcher
@@ -211,7 +213,7 @@ class CanalPlusSession(ScraperSession):
             return None, FetchOutcome.not_found("not found at Canal+")
         except CanalPlusError as exc:
             return None, self._fetch_failure(exc)
-        if record.get("type") != SHOW or kind_of(record) != kind:
+        if record.get("type") != SHOW or kind_of(record, self.site) != kind:
             return None, FetchOutcome.not_found(f"Canal+ ID is not a {KIND_LABEL[kind]} of the requested kind")
         return record, None
 
@@ -238,7 +240,7 @@ class CanalPlusSession(ScraperSession):
         object_id = show["objectID"]
         if object_id in self._families:
             return self._families[object_id]
-        root = series_root(show.get("url"))
+        root = series_root(show.get("url"), self.site)
         if root is None:
             raise CanalPlusFormatError("Canal+ series record has an unexpected page address")
         hits: dict[str, dict[str, Any]] = {}
@@ -277,7 +279,7 @@ class CanalPlusSession(ScraperSession):
             log.warning("Canal+ series %s: only %d of %s season/episode records could be read; missing seasons "
                         "and episodes are not treated as absent", object_id, received,
                         nb_hits if nb_hits is not None else "?")
-        family = build_family(list(hits.values()), root, complete)
+        family = build_family(list(hits.values()), root, complete, self.site)
         self._families[object_id] = family
         return family
 
@@ -335,9 +337,9 @@ class CanalPlusSession(ScraperSession):
                         season_number, episode_number, len(found), ", ".join(hit["objectID"][:60] for hit in found))
             return FetchOutcome.error(f"Canal+ lists episode {season_number}x{episode_number} more than once")
         hit = found[0]
-        if season_episode(hit) != (season_number, episode_number):  # pragma: no cover - grouped by these numbers
+        if season_episode(hit, self.site) != (season_number, episode_number):  # pragma: no cover - grouped by these numbers
             return FetchOutcome.error("Canal+ episode numbers are inconsistent")
-        meta = map_episode(hit, record)
+        meta = map_episode(hit, record, self.site)
         return FetchOutcome.ok(meta, remote_id=meta.remote_id)
 
     # -- manual IDs ----------------------------------------------------------------------------------
@@ -365,8 +367,8 @@ class CanalPlusSession(ScraperSession):
             for page in range(MAX_SEARCH_PAGES):
                 result = self.client.search(slug.replace("-", " "), SHOW_FILTER, page, SEARCH_PAGE_SIZE)
                 for hit in result.hits:
-                    if hit.get("type") == SHOW and kind_of(hit) == kind and canonical_path(hit["url"]) == wanted \
-                            and not page_of(hit["url"]).rest:  # type: ignore[union-attr]
+                    if hit.get("type") == SHOW and kind_of(hit, self.site) == kind and canonical_path(hit["url"], self.site) == wanted \
+                            and not page_of(hit["url"], self.site).rest:  # type: ignore[union-attr]
                         exact.setdefault(hit["objectID"], hit)
                 if result.nb_pages is None or page + 1 >= result.nb_pages or not result.hits:
                     break
@@ -390,13 +392,13 @@ class CanalPlusSession(ScraperSession):
             self.client.search("", SHOW_FILTER, 0, 1)
         except CanalPlusError as exc:
             return False, f"Search index: {redact(exc)}"
-        return True, "Canal+ connection successful (search index reachable)"
+        return True, f"Canal+ connection successful ({self.site.label}, search index reachable)"
 
 
 class CanalPlusPlugin(ScraperPlugin):
     plugin_id = "canalplus"
-    display_name = "Canal+ (NL)"
-    version = "20261009"
+    display_name = "Canal+"
+    version = "20261015"
     capabilities = frozenset({
         Capability.MOVIES, Capability.SERIES, Capability.SEASONS, Capability.EPISODES,
         Capability.ARTWORK, Capability.EXTERNAL_IDS,
@@ -408,6 +410,10 @@ class CanalPlusPlugin(ScraperPlugin):
 
     def config_schema(self) -> list[ConfigField]:
         return [
+            ConfigField("country", "Country and language", FieldType.SELECT, default="", required=True,
+                        choices=[("", CHOOSE_LABEL)] + [(site.tag, site.label) for site in SITES],
+                        help="Required. The Canal+ website whose catalogue is searched. Canal+ titles and IDs "
+                             "differ per country, so changing it matches every title again."),
             ConfigField("threshold", "Title match threshold", FieldType.INTEGER, default=85, minimum=0, maximum=100,
                         help="Minimum confidence (0–100) for a title match."),
         ]
@@ -420,7 +426,8 @@ class CanalPlusPlugin(ScraperPlugin):
             ManualIdField(NAMESPACE, "Canal+ ID", help="The Canal+ search record ID (letters, digits, - and _).",
                           pattern_hint="letters, digits, - and _"),
             ManualIdField(PAGE_NAMESPACE, "Canal+ page address",
-                          help="The title's page on canalplus.nl/stream; an episode page works for a series.",
+                          help="The title's page on the Canal+ website of the country set for the plugin "
+                               "(e.g. canalplus.nl/stream); an episode page works for a series.",
                           placeholder=f"https://www.canalplus.nl/stream/{page}/"),
         ]
 
@@ -442,8 +449,8 @@ class CanalPlusPlugin(ScraperPlugin):
             raise ManualIdError("Canal+ only accepts Canal+ IDs and page addresses")
         if text.startswith(("film/", "series/", "/stream/", "stream/")):
             path = text.lstrip("/")
-            text = f"https://{SITE_HOST}/" + (path if path.startswith("stream/") else f"stream/{path}")
-        path = canonical_path(text)
+            text = f"https://{DEFAULT.host}/" + (path if path.startswith("stream/") else f"stream/{path}")
+        path = next((found for site in SITES if (found := canonical_path(text, site)) is not None), None)
         if path is None:
             raise ManualIdError("Enter a Canal+ page address such as https://www.canalplus.nl/stream/series/snoepjes/")
         return path
@@ -455,10 +462,14 @@ class CanalPlusPlugin(ScraperPlugin):
         return clean
 
     def is_configured(self, config: dict[str, Any]) -> bool:
-        return True  # no account or key needed
+        """Configured once a country is chosen (no account or key is needed); there is no default, so
+        the plugin never searches a catalogue the user did not pick."""
+        return config.get("country") in SITE_TAGS
 
     def test_connection(self, config: dict[str, Any]) -> TestResult:
         """Search settings discovery and one search request (see :meth:`CanalPlusSession.self_test`)."""
+        if not self.is_configured(config):
+            return False, NOT_CONFIGURED_MESSAGE
         session = CanalPlusSession(self.client_factory(config), config, TitleMatcher(self.scoring_profile))
         try:
             return session.self_test()

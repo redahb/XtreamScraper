@@ -22,12 +22,15 @@ from xtreamscraper.metadata.models import Artwork, ArtworkType, MediaType, Metad
 from xtreamscraper.utils.coerce import as_text
 
 from .parsing import MOVIE, Asset, Person, SeriesFamily, asset, merge_people, people, season_episode, year_of
+from .sites import NL, Site
 
 NAMESPACE = "canalplus"
 MARKED, CLEAN = "marked", "ori"
 #: Providers whose ``/marked/`` images were verified to exist under ``/ori/`` without the
-#: watermark (posters, fanart and episode stills; checked 2026-10-09). Extend only with evidence.
-CLEAN_VARIANT_PROVIDERS = frozenset({"cpnl", "viaplaynl"})
+#: watermark (posters, fanart and episode stills): ``cpnl`` and ``viaplaynl`` (NL) on 2026-10-09,
+#: ``lovnaten`` (AT, HU), ``appletvcz`` and ``cpcz`` (CZ, SK) and ``histint`` (HU) on 2026-10-15, every
+#: image of each. Not ``dohu`` (HU): 26 of its 754 images have no clean version. Extend only with evidence.
+CLEAN_VARIANT_PROVIDERS = frozenset({"cpnl", "viaplaynl", "lovnaten", "appletvcz", "cpcz", "histint"})
 DIRECTOR_ROLE = "director"
 
 
@@ -204,10 +207,10 @@ def map_season(season_number: int, record: Optional[dict[str, Any]]) -> Metadata
     )
 
 
-def map_episode(hit: dict[str, Any], show: Optional[dict[str, Any]]) -> MetadataResult:
+def map_episode(hit: dict[str, Any], show: Optional[dict[str, Any]], site: Site = NL) -> MetadataResult:
     """An episode; no year or air date (``tvcpYear`` is the season's) and no invented title."""
     object_id = hit["objectID"]
-    season, episode = season_episode(hit)
+    season, episode = season_episode(hit, site)
     still = episode_still(hit, show)
     return MetadataResult(
         MediaType.EPISODE,

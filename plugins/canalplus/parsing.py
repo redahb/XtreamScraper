@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
 from urllib.parse import urlsplit
 
+from .sites import NL, Site
+
 log = logging.getLogger(__name__)
 
 MOVIE, SERIES = "movie", "series"
 SHOW, SEASON, EPISODE = "show", "showseason", "showepisode"
-SITE_HOST = "www.canalplus.nl"
+#: The Dutch website's host (the default site).
+SITE_HOST = NL.host
 ASSET_HOST = "storage.googleapis.com"
 ASSET_BUCKET = "tv-vod-assets"
 MIN_YEAR = 1870
@@ -26,8 +29,6 @@ MAX_SEASON, MAX_EPISODE = 9999, 99999
 #: Opaque Canal+ object IDs: URL-safe and of a sane length (their exact length is not a contract).
 OBJECT_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,199}")
-_SEASON_SEGMENT = re.compile(r"seizoen-(\d{1,4})")
-_EPISODE_SEGMENT = re.compile(r"aflevering-(\d{1,5})")
 _SHORT_EPISODE = re.compile(r"S(\d{1,4})E(\d{1,5})", re.IGNORECASE)
 _SHORT_SEASON = re.compile(r"S(\d{1,4})", re.IGNORECASE)
 _NUMBER = re.compile(r"(?<!\d)(\d{1,5})(?!\d)")
@@ -47,12 +48,12 @@ class Page(NamedTuple):
     rest: tuple[str, ...]
 
 
-def page_of(url: Any) -> Optional[Page]:
-    """The parts of an ``https://www.canalplus.nl/stream/(film|series)/<slug>/...`` address.
+def page_of(url: Any, site: Site = NL) -> Optional[Page]:
+    """The parts of an ``https://<site host>/stream/(film|series)/<slug>/...`` address.
 
     Userinfo, a port, another scheme or host, an empty or odd slug: ``None``. A series address
-    may continue with ``seizoen-N/`` and then ``aflevering-M/``; a film address may not continue.
-    Query and fragment are ignored.
+    may continue with the site's season segment (``seizoen-N/``) and then its episode segment
+    (``aflevering-M/``); a film address may not continue. Query and fragment are ignored.
     """
     if not isinstance(url, str) or len(url) > 2000:
         return None
@@ -61,7 +62,7 @@ def page_of(url: Any) -> Optional[Page]:
         port = parts.port
     except ValueError:
         return None
-    if parts.scheme != "https" or parts.hostname != SITE_HOST or port is not None or "@" in parts.netloc:
+    if parts.scheme != "https" or parts.hostname != site.host or port is not None or "@" in parts.netloc:
         return None
     if not parts.path.startswith("/"):
         return None
@@ -77,20 +78,20 @@ def page_of(url: Any) -> Optional[Page]:
         return None
     if segments[1] == "film" and rest:
         return None
-    if rest and not _SEASON_SEGMENT.fullmatch(rest[0]):
+    if rest and not site.season_segment.fullmatch(rest[0]):
         return None
-    if len(rest) > 2 or (len(rest) == 2 and not _EPISODE_SEGMENT.fullmatch(rest[1])):
+    if len(rest) > 2 or (len(rest) == 2 and not site.episode_segment.fullmatch(rest[1])):
         return None
     return Page(segments[1], slug, rest)
 
 
-def kind_of(hit: Any) -> Optional[str]:
+def kind_of(hit: Any, site: Site = NL) -> Optional[str]:
     """``movie`` for a ``show`` record under ``/stream/film/``, ``series`` for any record under
     ``/stream/series/``; ``None`` otherwise, also when a boolean ``tvcpIsMovie`` contradicts the
     address (never a guessed kind)."""
     if not isinstance(hit, dict):
         return None
-    page = page_of(hit.get("url"))
+    page = page_of(hit.get("url"), site)
     if page is None:
         return None
     is_movie = hit.get("tvcpIsMovie")
@@ -103,30 +104,30 @@ def kind_of(hit: Any) -> Optional[str]:
     return SERIES
 
 
-def is_trailer_page(hit: Any) -> bool:
+def is_trailer_page(hit: Any, site: Site = NL) -> bool:
     """A pseudo-movie whose film address slug ends in ``-trailer`` (e.g. ``snoepjes-trailer``)."""
-    page = page_of(hit.get("url")) if isinstance(hit, dict) else None
+    page = page_of(hit.get("url"), site) if isinstance(hit, dict) else None
     return page is not None and page.kind == "film" and page.slug.lower().endswith(_TRAILER_SUFFIX)
 
 
-def series_root(url: Any) -> Optional[str]:
-    """The canonical ``https://www.canalplus.nl/stream/series/<slug>/`` of any series address."""
-    page = page_of(url)
+def series_root(url: Any, site: Site = NL) -> Optional[str]:
+    """The canonical ``https://<site host>/stream/series/<slug>/`` of any series address."""
+    page = page_of(url, site)
     if page is None or page.kind != "series":
         return None
-    return f"https://{SITE_HOST}/stream/series/{page.slug}/"
+    return f"https://{site.host}/stream/series/{page.slug}/"
 
 
-def canonical_path(url: Any) -> Optional[str]:
+def canonical_path(url: Any, site: Site = NL) -> Optional[str]:
     """``film/<slug>`` or ``series/<slug>`` (a series' season/episode address gives the series)."""
-    page = page_of(url)
+    page = page_of(url, site)
     return None if page is None else f"{page.kind}/{page.slug}"
 
 
-def in_series(hit: Any, root: str) -> bool:
+def in_series(hit: Any, root: str, site: Site = NL) -> bool:
     """``hit``'s address is ``root`` or below it (exact prefix of the canonical address)."""
     url = hit.get("url") if isinstance(hit, dict) else None
-    return isinstance(url, str) and series_root(url) == root and url.strip().startswith(root)
+    return isinstance(url, str) and series_root(url, site) == root and url.strip().startswith(root)
 
 
 # -- years and numbers ----------------------------------------------------------------------------
@@ -174,30 +175,31 @@ def _only_number(text: Any) -> Optional[int]:
 
 
 def _from_fields(hit: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-    """``tvcpSeason`` ``"Seizoen 1"`` and ``tvcpEpisode`` ``"Aflevering 3"``."""
+    """The only number in ``tvcpSeason`` (``"Seizoen 1"``, ``"Staffel 1"``, ``"Évad 1"``...) and in
+    ``tvcpEpisode`` (``"Aflevering 3"``...)."""
     return _valid(_only_number(hit.get("tvcpSeason")), _only_number(hit.get("tvcpEpisode")))
 
 
-def _from_url(hit: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-    page = page_of(hit.get("url"))
+def _from_url(hit: dict[str, Any], site: Site) -> tuple[Optional[int], Optional[int]]:
+    page = page_of(hit.get("url"), site)
     if page is None or page.kind != "series" or not page.rest:
         return None, None
-    season = int(_SEASON_SEGMENT.fullmatch(page.rest[0]).group(1))  # type: ignore[union-attr]
-    episode = int(_EPISODE_SEGMENT.fullmatch(page.rest[1]).group(1)) if len(page.rest) == 2 else None  # type: ignore[union-attr]
+    season = int(site.season_segment.fullmatch(page.rest[0]).group(1))  # type: ignore[union-attr]
+    episode = int(site.episode_segment.fullmatch(page.rest[1]).group(1)) if len(page.rest) == 2 else None  # type: ignore[union-attr]
     return _valid(season, episode)
 
 
-def season_episode(hit: Any) -> tuple[Optional[int], Optional[int]]:
+def season_episode(hit: Any, site: Site = NL) -> tuple[Optional[int], Optional[int]]:
     """``(season, episode)`` of a season/episode record; ``episode`` is ``None`` for a season.
 
     Sources in order: ``tvcpShort`` (``S1E1,S01E01``), the numbers in ``tvcpSeason`` /
-    ``tvcpEpisode``, the page address (``seizoen-1/aflevering-1/``). The first source with both
+    ``tvcpEpisode`` (any language), the page address (``seizoen-1/aflevering-1/`` on the Dutch site). The first source with both
     numbers wins; otherwise the first with a season. Season 0 (specials) is allowed; an episode is
     ``> 0``; nothing is ever negative.
     """
     if not isinstance(hit, dict):
         return None, None
-    sources = [_from_short(hit.get("tvcpShort")), _from_fields(hit), _from_url(hit)]
+    sources = [_from_short(hit.get("tvcpShort")), _from_fields(hit), _from_url(hit, site)]
     for season, episode in sources:
         if season is not None and episode is not None:
             return season, episode
@@ -302,7 +304,7 @@ class SeriesFamily:
         return [hit for (s, _e), hits in sorted(self.episodes.items()) if s == season for hit in hits]
 
 
-def build_family(hits: list[dict[str, Any]], root: str, complete: bool = True) -> SeriesFamily:
+def build_family(hits: list[dict[str, Any]], root: str, complete: bool = True, site: Site = NL) -> SeriesFamily:
     """The family of the series at ``root`` from search hits (other series' records are dropped).
 
     Contract:
@@ -315,13 +317,13 @@ def build_family(hits: list[dict[str, Any]], root: str, complete: bool = True) -
     seen: set[str] = set()
     skipped = 0
     for hit in hits:
-        if not isinstance(hit, dict) or hit.get("type") not in (SEASON, EPISODE) or not in_series(hit, root):
+        if not isinstance(hit, dict) or hit.get("type") not in (SEASON, EPISODE) or not in_series(hit, root, site):
             continue
         object_id = hit.get("objectID")
         if not isinstance(object_id, str) or object_id in seen:
             continue
         seen.add(object_id)
-        season, episode = season_episode(hit)
+        season, episode = season_episode(hit, site)
         if hit["type"] == SEASON:
             if season is None:
                 skipped += 1
